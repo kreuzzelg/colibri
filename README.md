@@ -390,7 +390,7 @@ the full 756 GB on disk at once:
 
 #### Other supported models
 
-GLM-5.2 is the reference model, but the same streaming approach runs three more
+GLM-5.2 is the reference model, but the same streaming approach runs four more
 families. Each is a **sibling engine** — one C file, its own architecture, the same
 `coli chat` / `coli serve` / `coli web` front end (the launcher picks the binary from
 the model's `config.json`):
@@ -407,6 +407,7 @@ the model's `config.json`):
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
 > | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 32 GB comfortable | optional; an NVIDIA card (any sm_80+, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
+> | **Qwen3.6-35B-A3B** | ~20 GB (int4 gs64) | 16 GB min, 24 GB comfortable | not needed |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts
 > are streamed from it — expect a fraction of a token per second on a slow drive
@@ -419,6 +420,7 @@ the model's `config.json`):
 | **Kimi K3** (Moonshot) | 2.8T / 104B | [`moonshotai/Kimi-K3`](https://huggingface.co/moonshotai/Kimi-K3) — original checkpoint, routed experts stay **native MXFP4** | `make -C c kimi_k3` | [kimi_k3.md](docs/kimi_k3.md) |
 | **DeepSeek V4 Flash** | 284B / 13B | official sharded checkpoint — routed experts stay **native fp4**, dense stays fp8-e4m3 | `make -C c deepseek-v4` | [deepseek-v4.md](docs/deepseek-v4.md) |
 | **OLMoE** (AI2) | 7B / 1B | converted with `c/tools/convert_olmoe_merged.py` — **int8** container, ~7 GB | `make -C c olmoe` | — |
+| **Qwen3.6-35B-A3B** (Alibaba) | 35B / ~3B | [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) — converted with `c/tools/convert_qwen36.py`, or pre-converted int4 gs64 container | `make -C c qwen36` | [qwen36.md](docs/qwen36.md) |
 
 Kimi K3 needs no conversion: its QAT-trained MXFP4 experts are streamed straight from
 the original Hugging Face shards, and the bf16 dense set is quantized at load time.
@@ -544,9 +546,9 @@ checkpoint validation, and the generated tiny independent oracle.
   lower cost per useful token. Everything lands the way this project works:
   measured end to end, reviewed, and developed in the open.
 - **More open models.** The tiering algorithm is model-agnostic: any MoE with
-  routed experts can be staged the same way. GLM-5.2 and OLMoE run today;
-  support for more open-weight families — **Kimi K2** (Moonshot AI),
-  **Qwen3 MoE** (Alibaba), **MiniMax** — is on the roadmap.
+  routed experts can be staged the same way. GLM-5.2, OLMoE, and Qwen3.6-35B-A3B
+  run today; support for more open-weight families — **Kimi K2** (Moonshot AI),
+  **MiniMax** — is on the roadmap.
 
 ## Supporting the project
 
@@ -570,6 +572,7 @@ c/
 ├── kimi_k3.c             Kimi K3 engine  (make kimi_k3)
 ├── deepseek_v4.c         DeepSeek V4 Flash engine  (make deepseek-v4)
 ├── olmoe.c               OLMoE engine  (make olmoe)
+├── qwen36.c              Qwen3.6-35B-A3B engine  (make qwen36)
 │
 ├── st.h                  safetensors index and range reads
 ├── quant.h               canonical container decoders

@@ -21,6 +21,9 @@
 #include <sys/stat.h>
 #include "json.h"
 #include "compat.h"
+#if defined(__AVX2__) || defined(__F16C__)
+#include <immintrin.h>
+#endif
 
 /* tetto sulla dimensione dell'header safetensors: gli header reali sono piccoli
  * (KB..pochi MB). Un file crafted che dichiara un hlen enorme causerebbe una
@@ -136,6 +139,29 @@ static inline float f16_to_f32(uint16_t h) {
         u = sign | ((exp - 15 + 127) << 23) | (man << 13);
     }
     float f; memcpy(&f, &u, 4); return f;
+}
+
+static inline void bf16_to_f32_n(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+#if defined(__AVX2__)
+    for (; i + 8 <= n; i += 8) {
+        __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)(src + i))), 16);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(w));
+    }
+#endif
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+}
+
+/* vcvtph2ps quiets signalling NaNs, the scalar loop preserves their payload.
+ * Over all 65536 f16 values that is the only difference: 1022 sNaN, and none
+ * on finites, subnormals, zeros, infinities or quiet NaNs. */
+static inline void f16_to_f32_n(const uint16_t *src, float *dst, int64_t n) {
+    int64_t i = 0;
+#if defined(__F16C__)
+    for (; i + 8 <= n; i += 8)
+        _mm256_storeu_ps(dst + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + i))));
+#endif
+    for (; i < n; i++) dst[i] = f16_to_f32(src[i]);
 }
 
 static int st_open_fd(shards *S, const char *path) {
@@ -703,9 +729,9 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = bf16_to_f32(p[i]);
+        bf16_to_f32_n((const uint16_t *)raw, out, t->numel);
     } else {
-        uint16_t *p = (uint16_t *)raw; for (int64_t i = 0; i < t->numel; i++) out[i] = f16_to_f32(p[i]);
+        f16_to_f32_n((const uint16_t *)raw, out, t->numel);
     }
     free(raw);
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
@@ -873,8 +899,8 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     if (!raw) { fprintf(stderr, "malloc %lld bytes for slice %s failed\n", (long long)nb, name); exit(1); }
     st_pread_full(t->fd, raw, nb, boff, "pread slice");   /* dev #331: chunked + EINTR + honest short-read */
     if (t->dtype == 2) memcpy(out, raw, nb);
-    else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
-    else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
+    else if (t->dtype == 0) bf16_to_f32_n((const uint16_t *)raw, out, n_elems);
+    else f16_to_f32_n((const uint16_t *)raw, out, n_elems);
     free(raw);
     if (drop) posix_fadvise(t->fd, boff, nb, POSIX_FADV_DONTNEED);
 }
