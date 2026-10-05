@@ -194,7 +194,9 @@ def tiny_glm_dsa(hidden=256, n_ff_exp=256, n_expert=4, block_count=2, dense_lead
     w = GgufWriter()
     w.add_str("general.architecture", arch).add_str("general.name", "tiny glm-dsa fixture")
     w.add_u32("general.quantization_version", 2).add_u32("general.file_type", 15)
-    w.add_u32(f"{arch}.block_count", block_count).add_u32(f"{arch}.embedding_length", hidden)
+    # llama.cpp convention: block_count includes the NextN block(s); `block_count` here is the
+    # TRUNK depth, so the key written is block_count + 1 when the MTP layer is present.
+    w.add_u32(f"{arch}.block_count", block_count + (1 if with_mtp else 0)).add_u32(f"{arch}.embedding_length", hidden)
     w.add_u32(f"{arch}.expert_count", n_expert).add_u32(f"{arch}.expert_used_count", 2)
     w.add_u32(f"{arch}.expert_feed_forward_length", n_ff_exp).add_u32(f"{arch}.feed_forward_length", 2 * n_ff_exp)
     w.add_u32(f"{arch}.leading_dense_block_count", dense_lead).add_u32(f"{arch}.expert_shared_count", 1)

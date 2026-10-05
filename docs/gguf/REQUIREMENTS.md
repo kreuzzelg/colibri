@@ -239,6 +239,7 @@ v1 is accepted when all of the following hold on the experiment branch:
 | `glm-dsa` GGUFs may lack `attn_kv_b` and ship only the absorbed `attn_k_b`/`attn_v_b` (per-head transposed). | Attention path mismatch. | FR-18; ARCHITECTURE §7.3 reconciles by widening `attn_k_b` to f16/f32 at load (≈0.6–1.3 GB resident for 78 layers) in v1, transposed kernel later. Verify on the first real file (`coli gguf inspect`). |
 | MTP head quantized too coarsely in public GGUFs. | Draft acceptance collapses (#8). | FR-23: auto-disable below 8 bits with a warning; measure acceptance in the A/B. |
 | llama.cpp's `glm-dsa` indexer/tensor set is still moving (indexer runtime landed after the loader; metadata keys changed once). | Files in the wild differ by converter version. | Reader tolerates missing optional keys with defaults; `doctor` prints `general.*` provenance; the name table is one place to patch. |
+| Public quants keep the dense set at `Q8_0` (`UD-Q4_K_XL`: 21.0 GB resident vs 9.9 GB for the int4 container). | Small hosts cannot hold the dense set; re-quantizing is forbidden by NFR-3. | `coli doctor` fails `memory.ram` on the dense set alone (done, phase 1); inspect `UD-Q4_K_M`/`UD-Q4_K_S` for a 4–5-bit attention set; phase 5 can keep `Q8_0` dense tensors on the GPU. See the [inspection report](inspection-glm52-ud-q4_k_xl-2026-10-05.md). |
 | K-quant dequant cost on CPU-bound hosts. | Slower than fmt=4 at full residency. | NFR-5 measured honestly; FR-13 int8-activation path in Phase 5; fused pair (FR-12). |
 | Three reads per expert instead of one, possibly across split files. | More IOPS, worse O_DIRECT efficiency on some drives. | Offset-ordered reads, `PIPE`/`URING` batching per slice; measure on NVMe; an optional on-disk "expert index" cache is a Phase 6 idea, not v1. |
 | Tokenizer drift (byte-level BPE from GGUF arrays vs HF `tokenizer.json`). | Wrong tokens → wrong outputs. | Test: encode/decode of `tests/tok_o200k_cases.txt`-style corpus must match the `tokenizer.json` path on the same model; prefer the HF file when present. |
@@ -247,8 +248,11 @@ v1 is accepted when all of the following hold on the experiment branch:
 ## 11. Open questions for the maintainer
 
 1. **Which public GGUF is the reference artefact** for the A/B? Proposal:
-   `unsloth/GLM-5.2-GGUF` `UD-Q4_K_XL` (K-quants only, no I-quants) — to be
-   confirmed by inspecting its type mix with `coli gguf inspect` first.
+   `unsloth/GLM-5.2-GGUF` `UD-Q4_K_XL` — inspected on 2026-10-05: 11 parts,
+   1809 tensors, type mix `Q4_K`/`Q5_K`/`Q6_K`/`Q8_0`/`F32` only (all in the v1
+   set), MTP head `Q8_0`, indexer on every layer, dense set 21.0 GB
+   ([report](inspection-glm52-ud-q4_k_xl-2026-10-05.md)). Open: whether a
+   lighter dense set (`UD-Q4_K_M`) should be the reference for ≤25 GB hosts.
 2. **MTP policy**: auto-disable below 8 bits (FR-23) or hard-refuse? Proposal:
    warn + disable, `MTP=1` forces.
 3. **Indexer in v1?** Proposal: load if present (SHOULD), otherwise dense MLA;

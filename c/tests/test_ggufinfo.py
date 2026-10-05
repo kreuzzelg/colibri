@@ -150,7 +150,9 @@ class GgufInfoTest(unittest.TestCase):
         s = summarize(parts)
         self.assertEqual(s["architecture"], "glm-dsa")
         self.assertEqual(s["engine"], "glm")
-        self.assertEqual(s["block_count"], 2)
+        self.assertEqual(s["block_count"], 3)          # 2 trunk + 1 nextn, llama.cpp convention
+        self.assertEqual(s["trunk_layers"], 2)
+        self.assertEqual(s["nextn_predict_layers"], 1)
         self.assertEqual(s["expert_count"], 4)
         self.assertEqual(s["expert_layers"], 2)          # blk.1 (routed) + blk.2 (MTP layer)
         self.assertEqual(s["experts_per_layer"], 4)

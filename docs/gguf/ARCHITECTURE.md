@@ -327,7 +327,7 @@ main embedding and head as today.)
 | `Cfg` field | GGUF key (`glm-dsa.` prefix unless noted) | Notes |
 |---|---|---|
 | `hidden` | `embedding_length` | |
-| `n_layers` | `block_count` | excludes NextN |
+| `n_layers` | `block_count − nextn_predict_layers` | llama.cpp counts the NextN block **inside** `block_count` (GLM-5.2: 79 = 78 + 1, MTP tensors under `blk.78.*`; verified on `unsloth/GLM-5.2-GGUF`, see [inspection report](inspection-glm52-ud-q4_k_xl-2026-10-05.md)) |
 | `n_heads` | `attention.head_count` | |
 | `n_experts` | `expert_count` | may be < 256 (REAP) |
 | `topk` | `expert_used_count` | |
@@ -347,9 +347,9 @@ main embedding and head as today.)
 | `theta` | `rope.freq_base` | |
 | `vocab` | `len(tokenizer.ggml.tokens)` (cross-check `output.weight.ne[1]`) | |
 | `index_topk/nh/hd` | `attention.indexer.top_k`, `.head_count`, `.key_length` | 0 if absent → `has_dsa=0` |
-| `idx_type[]` | `attention.indexer.types` array if present, else derived from which layers carry `indexer.attn_k` | |
+| `idx_type[]` | `attention.indexer.types` array if present, else derived from which layers carry `indexer.attn_k` | the unsloth file has no `types` key and indexer tensors on **every** block |
 | `stop_ids` | `tokenizer.ggml.eos_token_id`, `eot_token_id`, + by-name `<|user|>`, `<|observation|>`, `<|endoftext|>` | FR-20 |
-| (MTP present) | `nextn_predict_layers ≥ 1` and tensors at `blk.n_layers` | FR-23 |
+| (MTP present) | `nextn_predict_layers ≥ 1` and `blk.<n_layers>.nextn.*` present | FR-23; `eh_proj` is `Q8_0` in `UD-Q4_K_XL` |
 
 Range validation reuses the `CKR` macro block verbatim (factor it into a
 `cfg_validate(Cfg*)` called by both arms).
@@ -385,13 +385,17 @@ llama.cpp's `glm-dsa` loader declares the **absorbed split**:
 - `attn_v_b` `{kv_lora, v_head, n_head}` → per head `[v_head rows × kv_lora]` =
   kv_b's v-slice in the engine's orientation (concatenate heads → direct view).
 
+Verified on `unsloth/GLM-5.2-GGUF` (`UD-Q4_K_XL`): **no `attn_kv_b`**; `attn_k_b`
+`{192, 512, 64}` and `attn_v_b` `{512, 256, 64}`, both `Q8_0`, on all 79 blocks.
+
 Policy, in order:
 
 1. If `blk.N.attn_kv_b.weight` exists → use it as `kv_b` (shape check), done.
 2. Else build `kv_b`'s **v part** as a view/copy of `attn_v_b` (same orientation)
    and its **k part** by **widening** `attn_k_b` to f16 (or f32) and
    transposing per head at load. Cost: `H·qk_nope·kv_lora` values per layer
-   (for 64 heads, 128×512 → 8 MB f16 / 16 MB f32 per layer, ~0.6–1.3 GB total);
+   (GLM-5.2: 64 heads × 192 × 512 → 12.6 MB f16 / 25 MB f32 per layer, ≈1.0–2.0 GB
+   for 79 layers);
    lossless, so permitted by NFR-3. The resulting `kv_b` is a mixed-format
    pair (`k_b` f16/f32, `v_b` native) → two `QT`s instead of one. The
    attention code already splits k/v rows by head offset, so this is a local
@@ -399,9 +403,9 @@ Policy, in order:
 3. Phase 5 option: a transposed-weight kernel consuming `attn_k_b` natively
    (natural for the absorbed `q_nope · k_bᵀ` product), removing the widening.
 
-`attn_k_b` has `ne[0] = qk_nope` (128), not a multiple of 256, so
+`attn_k_b` has `ne[0] = qk_nope` (192), not a multiple of 256, so
 `llama-quantize` stores it as `Q8_0`/`Q4_0`-class or `F16` — all in the v1
-type set.
+type set (`Q8_0` in the inspected file).
 
 ### 7.4 Tokenizer (`ts_tok`, GGUF arm)
 
@@ -447,7 +451,8 @@ fmt[k] = QT_FMT_GGML(T.type); gs[k] = block; has_q = 0
 ```
 
 (`D = hidden`, `I = moe_inter`, `E = n_experts`; QT shapes are `g,u: [O=I, I=D]`,
-`d: [O=D, I=I]`, exactly today's `OO/II` arrays.) Shape checks against `Cfg`
+`d: [O=D, I=I]`, exactly today's `OO/II` arrays. Verified: `ffn_gate_exps`
+`{6144, 2048, 256}` Q4_K, `ffn_down_exps` `{2048, 6144, 256}` Q5_K.) Shape checks against `Cfg`
 happen once per layer at startup, not per load.
 
 ### 8.2 Load path (`expert_load_impl`)
@@ -486,10 +491,18 @@ upload functions return 0 for `qt_is_ggml(fmt)` in v1 (explicit, with the
 
 Bits per weight: colibrì fmt=4 gs64 = 4 + 32/64 = **4.5 bpw**; `Q4_K` =
 144·8/256 = **4.5 bpw**. A pure-`Q4_K` expert therefore moves the same bytes as
-today's container expert. `Q4_K_M` files typically store `ffn_down_exps` at
-`Q6_K` for part of the layers (6.56 bpw), so a `Q4_K_M` expert averages
-~5.2 bpw — about **15% more bytes** than gs64 int4; `UD-Q4_K_XL` differs
-again. The A/B must report bytes/token, not just tok/s.
+today's container expert. Measured on `UD-Q4_K_XL`: gate/up `Q4_K`, down
+`Q5_K` (`Q6_K` on 4 layers) → **22.81 MB per expert**, +7.5% over the 21.2 MB
+of a gs64 int4 expert; 446 GB of experts in total. The A/B must report
+bytes/token, not just tok/s.
+
+The flip side of the same file: every attention, shared-expert, indexer and
+embedding matrix is `Q8_0`, so the **resident dense set is 21.0 GB** against
+9.9 GB for the int4 container. On a 25 GB host that leaves ~4 GB for expert
+cache and KV; on 16 GB it does not fit. The precision invariant forbids
+re-quantizing at load, so small hosts need a GGUF whose attention is 4–5 bit
+(`UD-Q4_K_M`/`UD-Q4_K_S`, to be inspected) or phase-5 `Q8_0` residency on the
+GPU. `coli doctor` already fails `memory.ram` on the dense set alone.
 
 ## 9. Python side
 

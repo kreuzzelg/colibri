@@ -370,12 +370,20 @@ def summarize(parts):
         per_layer[int(m.group(1))] = per_layer.get(int(m.group(1)), 0) + t.nbytes // n_exp
         expert_bytes += t.nbytes
     block_count = kv.get(f"{arch}.block_count") if arch else None
+    nextn = kv.get(f"{arch}.nextn_predict_layers") if arch else None
+    # llama.cpp counts the NextN (MTP) blocks INSIDE block_count: GLM-5.2 has 78 trunk layers
+    # + 1 MTP layer = block_count 79, nextn_predict_layers 1, MTP tensors under blk.78.*
+    # (verified on unsloth/GLM-5.2-GGUF). Trunk layers = block_count - nextn.
     mtp = None
+    trunk_layers = block_count
     if isinstance(block_count, int):
-        eh = next((t for t in tensors if t.name == f"blk.{block_count}.nextn.eh_proj.weight"), None)
-        if eh is not None:
-            mtp = {"layer": block_count, "eh_proj_type": eh.type_name,
-                   "eh_proj_bits": bits_per_weight(eh.type)}
+        n_next = nextn if isinstance(nextn, int) and not isinstance(nextn, bool) else 0
+        trunk_layers = block_count - n_next
+        for L in range(block_count - 1, max(trunk_layers - 1, -1), -1) if n_next else range(block_count, block_count + 1):
+            eh = next((t for t in tensors if t.name == f"blk.{L}.nextn.eh_proj.weight"), None)
+            if eh is not None:
+                mtp = {"layer": L, "eh_proj_type": eh.type_name, "eh_proj_bits": bits_per_weight(eh.type)}
+                break
     indexer_layers = sorted(int(INDEXER_RE.match(t.name).group(1)) for t in tensors if INDEXER_RE.match(t.name))
     tokens = kv.get("tokenizer.ggml.tokens")
     return {
@@ -393,6 +401,8 @@ def summarize(parts):
         "unknown_types": unknown,
         "unsupported_v1": unsupported,
         "block_count": block_count,
+        "nextn_predict_layers": nextn,
+        "trunk_layers": trunk_layers,
         "expert_count": kv.get(f"{arch}.expert_count") if arch else None,
         "expert_layers": len(per_layer),
         "experts_per_layer": experts_per_layer,
@@ -454,6 +464,7 @@ def format_inspect(parts, summary, tensors=False):
                      f"{_fmt_bytes(summary['typical_expert_bytes'])} per expert · {_fmt_bytes(summary['expert_bytes'])} total")
         lines.append(f"dense         {_fmt_bytes(summary['dense_bytes'])} resident")
     mtp = summary["mtp"]
+    lines.append(f"layers        {summary['trunk_layers']} trunk + {summary['nextn_predict_layers'] or 0} nextn (block_count {summary['block_count']})")
     lines.append(f"mtp           {'blk.%d nextn · eh_proj %s (%.2f bpw)' % (mtp['layer'], mtp['eh_proj_type'], mtp['eh_proj_bits']) if mtp else 'absent'}")
     lines.append(f"indexer       {str(len(summary['indexer_layers'])) + ' layers' if summary['indexer_layers'] else 'absent'}")
     tok = summary["tokenizer"]

@@ -9,7 +9,7 @@ changing the safetensors path or the project's precision invariant.
 | Phase | Branch | State |
 |---|---|---|
 | 0 — documents | `claude/epic-edison-u3ncsq` | done |
-| 1 — reader | `gguf/p1-reader` | implemented: `c/gguf.h`, `c/ggufinfo.py`, `c/tools/make_gguf_fixture.py`, `tests/test_gguf.c`, `tests/test_ggufinfo.py`, `coli gguf inspect`, `coli doctor` GGUF checks. No engine wiring. |
+| 1 — reader | `gguf/p1-reader` | implemented: `c/gguf.h`, `c/ggufinfo.py`, `c/tools/make_gguf_fixture.py`, `tests/test_gguf.c`, `tests/test_ggufinfo.py`, `coli gguf inspect`, `coli doctor` GGUF checks. No engine wiring. Verified on `unsloth/GLM-5.2-GGUF` `UD-Q4_K_XL` (11 parts, 1809 tensors): [inspection report](inspection-glm52-ud-q4_k_xl-2026-10-05.md). |
 | 2 — kernels | — | not started |
 | 3 — assembly | — | not started |
 | 4 — streaming | — | not started |
