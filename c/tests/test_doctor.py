@@ -350,3 +350,127 @@ class DoctorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GgufDoctorTest(unittest.TestCase):
+    """`coli doctor` on a GGUF model (docs/gguf/REQUIREMENTS.md FR-35): metadata-only checks,
+    the v1 type set, the MTP precision guard, split handling and the --deep payload touch."""
+
+    def setUp(self):
+        from tools.make_gguf_fixture import tiny_glm_dsa, demo_writer, write_split_set
+        self.tiny_glm_dsa, self.demo_writer, self.write_split_set = tiny_glm_dsa, demo_writer, write_split_set
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.engine = self.root / "glm"
+        self.engine.write_text("#!/bin/sh\nexit 0\n")
+        self.engine.chmod(0o755)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def report(self, model, **overrides):
+        arguments = {"model": model, "ram_gb": 16, "context": 32, "gpu_indices": [], "vram_gb": 0,
+                     "engine_path": self.engine, "available_memory": 32 * GB, "available_disk": 100 * GB,
+                     "gpus": [], "linkage": {"linked": False, "missing": False}}
+        arguments.update(overrides)
+        return run_doctor(**arguments)
+
+    @staticmethod
+    def by_id(report):
+        return {c["id"]: c for c in report["checks"]}
+
+    def test_tiny_glm_dsa_passes(self):
+        path = self.root / "glm.gguf"
+        self.tiny_glm_dsa().write(path)
+        report = self.report(path)
+        checks = self.by_id(report)
+        self.assertEqual(report["status"], "ok", format_doctor(report))
+        self.assertIsNone(report["plan"])
+        self.assertEqual(checks["model.gguf.header"]["status"], "pass")
+        self.assertIn("glm-dsa", checks["model.gguf.header"]["summary"])
+        self.assertEqual(checks["model.gguf.arch"]["details"]["engine"], "glm")
+        self.assertEqual(checks["model.gguf.types"]["status"], "pass")
+        self.assertEqual(checks["model.gguf.mtp_precision"]["status"], "pass")
+        self.assertEqual(checks["model.tokenizer"]["status"], "pass")
+        self.assertEqual(checks["storage.persistence"]["status"], "pass")
+        self.assertTrue(checks["storage.persistence"]["details"]["path"].endswith(".coli-glm"))
+        self.assertEqual(checks["memory.ram"]["status"], "pass")
+        self.assertEqual(checks["placement.plan"]["status"], "skip")
+        self.assertNotIn("model.gguf.payload", checks)          # only with --deep
+        self.assertEqual(exit_code(report), 0)
+        text = format_doctor(report)
+        self.assertIn("model.gguf.arch", text)
+
+    def test_deep_touches_payload_and_checks_mirror(self):
+        path = self.root / "glm.gguf"
+        self.tiny_glm_dsa().write(path)
+        mirror = self.root / "mirror"
+        mirror.mkdir()
+        (mirror / "glm.gguf").write_bytes(path.read_bytes())
+        checks = self.by_id(self.report(path, deep=True, mirror_dir=str(mirror)))
+        self.assertEqual(checks["model.gguf.payload"]["status"], "pass")
+        self.assertEqual(checks["storage.mirror"]["status"], "pass")
+        # a mirror whose header differs is rejected, a truncated primary fails the payload touch
+        blob = bytearray(path.read_bytes())
+        blob[40] ^= 1
+        (mirror / "glm.gguf").write_bytes(blob)
+        checks = self.by_id(self.report(path, deep=True, mirror_dir=str(mirror)))
+        self.assertEqual(checks["storage.mirror"]["status"], "warn")
+        path.write_bytes(path.read_bytes()[:-1])
+        report = self.report(path, deep=True)
+        self.assertEqual(self.by_id(report)["model.gguf.header"]["status"], "fail")   # last tensor runs past EOF
+
+    def test_unsupported_types_and_low_precision_mtp_warn(self):
+        path = self.root / "iq.gguf"
+        self.tiny_glm_dsa(expert_type="IQ3_XXS", mtp_type="Q4_K").write(path)
+        report = self.report(path)
+        checks = self.by_id(report)
+        self.assertEqual(report["status"], "warning")
+        self.assertEqual(checks["model.gguf.types"]["status"], "warn")
+        self.assertIn("IQ3_XXS", checks["model.gguf.types"]["summary"])
+        self.assertEqual(checks["model.gguf.mtp_precision"]["status"], "warn")
+        self.assertIn("#8", checks["model.gguf.mtp_precision"]["summary"])
+
+    def test_foreign_architecture_and_unknown_type_fail(self):
+        path = self.root / "demo.gguf"
+        self.demo_writer(arch="glm4moe").write(path)
+        report = self.report(path)
+        checks = self.by_id(report)
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(checks["model.gguf.arch"]["status"], "fail")
+        self.assertIn("glm4moe", checks["model.gguf.arch"]["summary"])
+        self.assertEqual(checks["model.gguf.types"]["status"], "fail")      # type id 99
+        self.assertEqual(checks["model.gguf.mtp_precision"]["status"], "skip")
+        self.assertEqual(exit_code(report), 1)
+
+    def test_split_set_and_missing_part(self):
+        from tools.make_gguf_fixture import STR
+        demo = self.tiny_glm_dsa()
+        chunks = [[], []]
+        for i, t in enumerate(demo.tensors):
+            chunks[i % 2].append(t[:4])
+        sdir = self.root / "split"
+        paths = self.write_split_set(sdir, "glm", [(demo.kv if i == 0 else [], c) for i, c in enumerate(chunks)])
+        checks = self.by_id(self.report(sdir))
+        self.assertEqual(checks["model.gguf.header"]["status"], "pass")
+        self.assertEqual(checks["model.gguf.splits"]["details"]["parts"], 2)
+        self.assertEqual(checks["model.gguf.arch"]["status"], "pass")
+        Path(paths[1]).unlink()
+        report = self.report(sdir)
+        checks = self.by_id(report)
+        self.assertEqual(checks["model.gguf.header"]["status"], "fail")
+        self.assertIn("part 2 of 2", checks["model.gguf.header"]["summary"])
+        self.assertEqual(checks["model.gguf.splits"]["status"], "skip")
+        self.assertEqual(checks["model.gguf.arch"]["status"], "skip")
+        self.assertEqual(checks["placement.plan"]["status"], "skip")
+        self.assertEqual(report["status"], "error")
+
+    def test_safetensors_directory_is_untouched(self):
+        # a directory with config.json never takes the GGUF branch, even with a stray .gguf inside
+        model = self.root / "st"
+        model.mkdir()
+        (model / "config.json").write_text("{}")
+        (model / "x.gguf").write_bytes(b"GGUF")
+        checks = self.by_id(self.report(model))
+        self.assertIn("model.config", checks)
+        self.assertNotIn("model.gguf.header", checks)

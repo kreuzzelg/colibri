@@ -3,6 +3,17 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- **GGUF, phase 1 (reader only)** — `c/gguf.h` indexes a GGUF v3 file or split set
+  (headers only, bounded and overflow-checked like `st.h`), `c/ggufinfo.py` is the
+  stdlib reader behind `coli gguf inspect <path>` and `coli doctor`, which now
+  recognises a `.gguf` model and reports header/split consistency, architecture,
+  the v1 type mix, MTP head precision and (`--deep`) payload reachability and the
+  dual-SSD mirror. No engine wiring yet; the design is in `docs/gguf/`.
+
 ## [1.1.1] — 2026-07-23
 
 A same-day patch release. **Windows users on v1.1.0 should upgrade**: Microsoft

@@ -2,6 +2,7 @@
 """Read-only installation diagnostics for colibri."""
 
 import os
+import shutil
 import sys
 import json
 import re
@@ -9,6 +10,7 @@ import subprocess
 from pathlib import Path
 
 from resource_plan import GB, build_plan, discover_gpus, format_plan, memory_available
+import ggufinfo
 
 SAFETENSORS_MAX_HEADER = 512 << 20
 MODEL_INDEX_MAX_BYTES = SAFETENSORS_MAX_HEADER
@@ -402,11 +404,263 @@ def missing_shared_libraries(engine_path):
                    for line in result.stdout.splitlines() if "not found" in line})
 
 
+def _engine_checks(engine_path, gpu_indices, gpus, linkage):
+    """engine.binary + accelerator.cuda, shared by the safetensors and GGUF reports.
+    Returns (checks, detected_gpus, linkage)."""
+    checks = []
+    engine = Path(engine_path)
+    # On Windows, os.access(X_OK) always returns True for any existing file
+    # (NTFS has no execute bit; executability is governed by file extension).
+    # So a chmod(0o644) "non-executable" scenario can't be detected via X_OK
+    # on Windows. Use a platform-aware check: on POSIX, honor the mode bits;
+    # on Windows, any existing file is treated as executable. (#141)
+    if sys.platform == "win32":
+        engine_ok = engine.is_file()
+    else:
+        engine_ok = engine.is_file() and os.access(engine, os.X_OK)
+    if engine_ok:
+        unresolved = missing_shared_libraries(engine)
+        if unresolved:
+            checks.append(_check("engine.binary", "fail",
+                                 "engine cannot load: " + ", ".join(unresolved) +
+                                 " (install the runtime package, e.g. libgomp1, and retry)",
+                                 path=str(engine), missing=unresolved))
+        else:
+            checks.append(_check("engine.binary", "pass", "engine executable is ready", path=str(engine)))
+    elif engine.is_file():
+        checks.append(_check("engine.binary", "fail", "engine exists but is not executable", path=str(engine)))
+    else:
+        checks.append(_check("engine.binary", "fail", "engine is not built", path=str(engine)))
+
+    detected_gpus = discover_gpus() if gpus is None else list(gpus)
+    linkage = cuda_linkage(engine) if linkage is None else linkage
+    selected_gpus = detected_gpus
+    if gpu_indices is not None:
+        wanted = set(gpu_indices)
+        selected_gpus = [gpu for gpu in detected_gpus if gpu["index"] in wanted]
+
+    if gpu_indices == []:
+        checks.append(_check("accelerator.cuda", "skip", "GPU use was explicitly disabled"))
+    elif gpu_indices is not None and len(selected_gpus) != len(set(gpu_indices)):
+        checks.append(_check("accelerator.cuda", "fail", "one or more requested GPUs were not detected",
+                             requested=gpu_indices, detected=[gpu["index"] for gpu in detected_gpus]))
+    elif selected_gpus and linkage.get("missing"):
+        checks.append(_check("accelerator.cuda", "fail", "CUDA runtime library is missing"))
+    elif selected_gpus and linkage.get("linked"):
+        checks.append(_check("accelerator.cuda", "pass", "CUDA engine and devices are available",
+                             devices=[gpu["index"] for gpu in selected_gpus]))
+    elif selected_gpus:
+        checks.append(_check("accelerator.cuda", "warn", "NVIDIA GPU detected but the engine is CPU-only",
+                             devices=[gpu["index"] for gpu in selected_gpus]))
+    else:
+        checks.append(_check("accelerator.cuda", "skip", "no NVIDIA GPU detected; CPU path is available"))
+    return checks, detected_gpus, linkage
+
+
+def gguf_sidecar_dir(model):
+    """Where .coli_usage / .coli_kv live for a GGUF model: <dir>/.coli-<stem>/ (ARCHITECTURE.md §9.3),
+    so two GGUF models in one directory never share usage history or KV state."""
+    model = Path(model)
+    if model.is_dir():
+        parts = sorted(model.glob("*.gguf"))
+        first = parts[0] if parts else model / "model.gguf"
+        base = model
+    else:
+        first, base = model, model.parent
+    m = ggufinfo.SPLIT_RE.match(first.name)
+    stem = m.group(1) if m else first.stem
+    return base / f".coli-{stem}"
+
+
+def _gguf_deep(parts, mirror_dir):
+    """Touch the last byte of every sized tensor and check the padding before the data section
+    is zero; compare the metadata region against a configured mirror."""
+    touched = 0
+    for part in parts:
+        with open(part.path, "rb") as fh:
+            table_end = None
+            for t in part.tensors:
+                if t.nbytes is None or t.nbytes == 0:
+                    continue
+                fh.seek(t.off + t.nbytes - 1)
+                if len(fh.read(1)) != 1:
+                    raise ValueError(f"{part.path}: tensor {t.name} is not fully readable")
+                touched += 1
+            # padding between the tensor table and the first tensor must be zero
+            first = min((t.rel_off for t in part.tensors), default=0)
+            fh.seek(part.data_off)
+            pad = fh.read(min(first, part.alignment * 4))
+            if pad.strip(b"\0"):
+                raise ValueError(f"{part.path}: non-zero padding before the first tensor")
+    mirror = {"status": "skip", "summary": "no mirror configured", "details": {}}
+    if mirror_dir:
+        accepted, rejected = [], []
+        for part in parts:
+            cand = Path(mirror_dir) / Path(part.path).name
+            if not cand.is_file():
+                continue
+            if cand.stat().st_size != part.size:
+                rejected.append((cand.name, "size differs"))
+                continue
+            with open(part.path, "rb") as a, open(cand, "rb") as b:
+                same = a.read(part.data_off) == b.read(part.data_off)
+            (accepted if same else rejected).append((cand.name, "ok" if same else "header differs"))
+        if rejected:
+            mirror = {"status": "warn", "summary": f"{len(rejected)} mirror part(s) rejected, {len(accepted)} accepted",
+                      "details": {"rejected": rejected, "accepted": [n for n, _ in accepted]}}
+        elif accepted:
+            mirror = {"status": "pass", "summary": f"{len(accepted)} of {len(parts)} parts mirrored byte-identically",
+                      "details": {"accepted": [n for n, _ in accepted]}}
+        else:
+            mirror = {"status": "warn", "summary": "mirror directory holds none of the model's parts", "details": {}}
+    return {"touched": touched, "mirror": mirror}
+
+
+def _run_doctor_gguf(model, ram_gb, context, gpu_indices, vram_gb, *, engine_path, available_memory,
+                     available_disk, gpus, linkage, deep, mirror_dir):
+    """The GGUF report (docs/gguf/REQUIREMENTS.md FR-35). Metadata only — no payload is read
+    except the one-byte touches of --deep."""
+    checks = []
+    readable = os.access(model, os.R_OK)
+    checks.append(_check("model.path", "pass" if readable else "fail",
+                         ("GGUF model is readable" if readable else "GGUF model is not readable")
+                         + (" (directory)" if model.is_dir() else ""), path=str(model)))
+    parts = summary = None
+    try:
+        parts = ggufinfo.open_set(model, os.environ.get("COLI_MODEL_DIRS", ""))
+        summary = ggufinfo.summarize(parts)
+        checks.append(_check("model.gguf.header", "pass",
+                             f"GGUF v3 · {len(parts)} part{'s' if len(parts) != 1 else ''} · "
+                             f"{summary['tensors']} tensors · {summary['architecture']} · {summary['name']}",
+                             parts=[p.path for p in parts], tensors=summary["tensors"],
+                             file_bytes=summary["file_bytes"], alignment=parts[0].alignment))
+        if len(parts) == 1:
+            checks.append(_check("model.gguf.splits", "pass", "single file (no split metadata needed)"))
+        else:
+            checks.append(_check("model.gguf.splits", "pass",
+                                 f"{len(parts)} parts, split.no/split.count/split.tensors.count consistent",
+                                 parts=len(parts)))
+    except (ggufinfo.GgufError, OSError, ValueError) as error:
+        checks.append(_check("model.gguf.header", "fail", str(error)))
+        checks.append(_check("model.gguf.splits", "skip", "split check requires a readable header"))
+    if summary is not None:
+        arch = summary["architecture"]
+        if summary["engine"]:
+            checks.append(_check("model.gguf.arch", "pass", f"architecture {arch} → {summary['engine']} engine",
+                                 architecture=arch, engine=summary["engine"]))
+        else:
+            checks.append(_check("model.gguf.arch", "fail",
+                                 f"architecture {arch!r} is not supported by this engine "
+                                 f"(supported: {', '.join(sorted(ggufinfo.ENGINE_ARCHS))})", architecture=arch))
+        mix = " · ".join(f"{k} {v['tensors']}" for k, v in summary["type_mix"].items())
+        if summary["unknown_types"]:
+            names = ", ".join(f"{u['name']} (type {u['type']})" for u in summary["unknown_types"][:3])
+            checks.append(_check("model.gguf.types", "fail",
+                                 f"{len(summary['unknown_types'])} tensor(s) of unknown ggml type: {names}",
+                                 unknown=summary["unknown_types"]))
+        elif summary["unsupported_v1"]:
+            kinds = sorted({u["type"] for u in summary["unsupported_v1"]})
+            checks.append(_check("model.gguf.types", "warn",
+                                 f"{len(summary['unsupported_v1'])} tensor(s) use types outside the v1 set "
+                                 f"({', '.join(kinds)}); the engine will refuse them", type_mix=summary["type_mix"],
+                                 unsupported=summary["unsupported_v1"][:16]))
+        else:
+            checks.append(_check("model.gguf.types", "pass", f"all tensor types are in the v1 set: {mix}",
+                                 type_mix=summary["type_mix"]))
+        mtp = summary["mtp"]
+        if mtp is None:
+            checks.append(_check("model.gguf.mtp_precision", "skip", "no NextN (MTP) tensors in this file"))
+        elif mtp["eh_proj_bits"] is not None and mtp["eh_proj_bits"] < 8:
+            checks.append(_check("model.gguf.mtp_precision", "warn",
+                                 f"MTP head eh_proj is {mtp['eh_proj_type']} ({mtp['eh_proj_bits']:.2f} bpw): "
+                                 "below 8 bits the draft acceptance collapses (#8); MTP will be disabled",
+                                 **mtp))
+        else:
+            checks.append(_check("model.gguf.mtp_precision", "pass",
+                                 f"MTP head eh_proj is {mtp['eh_proj_type']} ({mtp['eh_proj_bits']:.2f} bpw)", **mtp))
+        tok = summary["tokenizer"]
+        if tok["tokens"]:
+            checks.append(_check("model.tokenizer", "pass",
+                                 f"embedded tokenizer: {tok['model']} · pre {tok['pre']} · {tok['tokens']} tokens",
+                                 **tok))
+        else:
+            checks.append(_check("model.tokenizer", "fail", "no tokenizer.ggml.tokens in the metadata"))
+    else:
+        for ident in ("model.gguf.arch", "model.gguf.types", "model.gguf.mtp_precision", "model.tokenizer"):
+            checks.append(_check(ident, "skip", "requires a readable GGUF header"))
+
+    sidecar = gguf_sidecar_dir(model)
+    if os.access(sidecar.parent, os.W_OK):
+        checks.append(_check("storage.persistence", "pass",
+                             f"usage and KV state will live in {sidecar.name}/", path=str(sidecar)))
+    else:
+        checks.append(_check("storage.persistence", "warn",
+                             "model directory is read-only; disable persistence or change permissions",
+                             path=str(sidecar)))
+
+    engine_checks, detected_gpus, linkage = _engine_checks(engine_path, gpu_indices, gpus, linkage)
+    checks.extend(engine_checks)
+    available_memory = memory_available() if available_memory is None else available_memory
+
+    if summary is not None:
+        if available_disk is None:
+            try:
+                available_disk = shutil.disk_usage(model if model.is_dir() else model.parent).free
+            except OSError:
+                available_disk = 0
+        disk_status = "warn" if available_disk < GB else "pass"
+        checks.append(_check("storage.disk", disk_status,
+                             "less than 1 GB is free for runtime state" if disk_status == "warn"
+                             else "model backing store is available",
+                             available_bytes=available_disk, model_bytes=summary["file_bytes"]))
+        dense = summary["dense_bytes"]
+        if not available_memory:
+            checks.append(_check("memory.ram", "warn", "available RAM could not be measured", dense_bytes=dense))
+        elif dense > available_memory:
+            checks.append(_check("memory.ram", "fail",
+                                 f"the resident dense set ({dense / GB:.1f} GB) exceeds available RAM",
+                                 available_bytes=available_memory, dense_bytes=dense))
+        else:
+            checks.append(_check("memory.ram", "pass",
+                                 f"resident dense set {dense / GB:.1f} GB · {summary['typical_expert_bytes'] / 1e6:.1f} MB per expert",
+                                 available_bytes=available_memory, dense_bytes=dense,
+                                 typical_expert_bytes=summary["typical_expert_bytes"]))
+        checks.append(_check("placement.plan", "skip", "GGUF placement planning arrives with phase 3"))
+    else:
+        for ident in ("storage.disk", "memory.ram", "placement.plan"):
+            checks.append(_check(ident, "skip", "requires a valid GGUF model"))
+
+    if deep:
+        if parts is None:
+            checks.append(_check("model.gguf.payload", "skip", "payload check requires a valid GGUF model"))
+            checks.append(_check("storage.mirror", "skip", "mirror check requires a valid GGUF model"))
+        else:
+            try:
+                report = _gguf_deep(parts, mirror_dir)
+                checks.append(_check("model.gguf.payload", "pass",
+                                     f"every sized tensor is readable to its last byte ({report['touched']} tensors)"))
+                mirror = report["mirror"]
+                checks.append(_check("storage.mirror", mirror["status"], mirror["summary"], **mirror["details"]))
+            except (OSError, ValueError) as error:
+                checks.append(_check("model.gguf.payload", "fail", str(error)))
+                checks.append(_check("storage.mirror", "skip", "mirror check requires a readable payload"))
+
+    statuses = {item["status"] for item in checks}
+    status = "error" if "fail" in statuses else "warning" if "warn" in statuses else "ok"
+    return {"schema_version": 1, "status": status, "model": str(model),
+            "mode": "deep" if deep else "standard", "checks": checks, "plan": None}
+
+
+
 def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                engine_path, available_memory=None, available_disk=None, gpus=None,
                linkage=None, deep=False, mirror_dir=None):
     """Collect a complete report. No model payload, engine, or CUDA context is loaded."""
     model = Path(model).expanduser().resolve()
+    if ggufinfo.is_gguf_source(model):
+        return _run_doctor_gguf(model, ram_gb, context, gpu_indices, vram_gb, engine_path=engine_path,
+                                available_memory=available_memory, available_disk=available_disk,
+                                gpus=gpus, linkage=linkage, deep=deep, mirror_dir=mirror_dir)
     checks = []
     plan = None
 
@@ -434,53 +688,9 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
     else:
         checks.append(_check("storage.persistence", "skip", "persistence requires a model directory"))
 
-    engine = Path(engine_path)
-    # On Windows, os.access(X_OK) always returns True for any existing file
-    # (NTFS has no execute bit; executability is governed by file extension).
-    # So a chmod(0o644) "non-executable" scenario can't be detected via X_OK
-    # on Windows. Use a platform-aware check: on POSIX, honor the mode bits;
-    # on Windows, any existing file is treated as executable. (#141)
-    if sys.platform == "win32":
-        engine_ok = engine.is_file()
-    else:
-        engine_ok = engine.is_file() and os.access(engine, os.X_OK)
-    if engine_ok:
-        unresolved = missing_shared_libraries(engine)
-        if unresolved:
-            checks.append(_check("engine.binary", "fail",
-                                 "engine cannot load: " + ", ".join(unresolved) +
-                                 " (install the runtime package, e.g. libgomp1, and retry)",
-                                 path=str(engine), missing=unresolved))
-        else:
-            checks.append(_check("engine.binary", "pass", "engine executable is ready", path=str(engine)))
-    elif engine.is_file():
-        checks.append(_check("engine.binary", "fail", "engine exists but is not executable", path=str(engine)))
-    else:
-        checks.append(_check("engine.binary", "fail", "engine is not built", path=str(engine)))
-
+    engine_checks, detected_gpus, linkage = _engine_checks(engine_path, gpu_indices, gpus, linkage)
+    checks.extend(engine_checks)
     available_memory = memory_available() if available_memory is None else available_memory
-    detected_gpus = discover_gpus() if gpus is None else list(gpus)
-    linkage = cuda_linkage(engine) if linkage is None else linkage
-    selected_gpus = detected_gpus
-    if gpu_indices is not None:
-        wanted = set(gpu_indices)
-        selected_gpus = [gpu for gpu in detected_gpus if gpu["index"] in wanted]
-
-    if gpu_indices == []:
-        checks.append(_check("accelerator.cuda", "skip", "GPU use was explicitly disabled"))
-    elif gpu_indices is not None and len(selected_gpus) != len(set(gpu_indices)):
-        checks.append(_check("accelerator.cuda", "fail", "one or more requested GPUs were not detected",
-                             requested=gpu_indices, detected=[gpu["index"] for gpu in detected_gpus]))
-    elif selected_gpus and linkage.get("missing"):
-        checks.append(_check("accelerator.cuda", "fail", "CUDA runtime library is missing"))
-    elif selected_gpus and linkage.get("linked"):
-        checks.append(_check("accelerator.cuda", "pass", "CUDA engine and devices are available",
-                             devices=[gpu["index"] for gpu in selected_gpus]))
-    elif selected_gpus:
-        checks.append(_check("accelerator.cuda", "warn", "NVIDIA GPU detected but the engine is CPU-only",
-                             devices=[gpu["index"] for gpu in selected_gpus]))
-    else:
-        checks.append(_check("accelerator.cuda", "skip", "no NVIDIA GPU detected; CPU path is available"))
 
     try:
         plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,

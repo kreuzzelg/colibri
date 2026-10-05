@@ -1,9 +1,26 @@
 # GGUF support — design documents
 
-Experiment branch `claude/epic-edison-u3ncsq`. Nothing here is implemented yet;
-these documents define what "GGUF support" means for colibrì and how it fits
-the existing engine without changing the safetensors path or the project's
-precision invariant.
+Experiment branch `claude/epic-edison-u3ncsq`. These documents define what
+"GGUF support" means for colibrì and how it fits the existing engine without
+changing the safetensors path or the project's precision invariant.
+
+## Status
+
+| Phase | Branch | State |
+|---|---|---|
+| 0 — documents | `claude/epic-edison-u3ncsq` | done |
+| 1 — reader | `gguf/p1-reader` | implemented: `c/gguf.h`, `c/ggufinfo.py`, `c/tools/make_gguf_fixture.py`, `tests/test_gguf.c`, `tests/test_ggufinfo.py`, `coli gguf inspect`, `coli doctor` GGUF checks. No engine wiring. |
+| 2 — kernels | — | not started |
+| 3 — assembly | — | not started |
+| 4 — streaming | — | not started |
+
+Try phase 1 on any GGUF (no model weights are read, only headers):
+
+```sh
+./coli gguf inspect /path/to/model-00001-of-00009.gguf      # or the directory, or a single file
+./coli doctor --model /path/to/model.gguf --deep
+make -C c tests/test_gguf && ./c/tests/test_gguf /path/to/model.gguf   # raw dump from the C reader
+```
 
 | Document | Content |
 |---|---|

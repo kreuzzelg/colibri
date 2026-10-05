@@ -27,6 +27,7 @@ Flags may also be given **after** the subcommand. Most flags map onto an engine 
 | `serve` | Start the OpenAI-compatible HTTP server. |
 | `bench [tasks]` | Run benchmark tasks (`--limit`, `--data`). |
 | `convert` | Convert an FP8 repo to a colibrì int4 snapshot. |
+| `gguf inspect <path>` | Metadata-only view of a GGUF model: parts, type mix, expert/dense bytes, MTP precision (`--tensors`, `--json`). Experimental, see [docs/gguf/](gguf/README.md). |
 
 ### Common flags (all subcommands)
 
