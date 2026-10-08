@@ -614,6 +614,20 @@ own. A lost device zeroes the state, rebuilds it on the CPU from the prefix reco
 PLE history replayed) and runs there from then on. `Q38_DN_GPU`'s per-layer step is not
 set up beside the chain; `KV_SLOTS` > 1 keeps the chain off.
 
+**Measured** (RTX 3070 alone, the FP8 checkpoint, the trunk's 553 matrices as int8 in VRAM, the
+tier at 16 % hits behind it, the usual 49-token prompt, 100 new tokens, two runs each):
+
+| | TTFT | tok/s, the run | ms per token | resident-mm per forward | DeltaNet | QSA | PLE | lm_head | shared |
+|---|---|---|---|---|---|---|---|---|---|
+| `Q38_DN_GPU=1` (the per-layer step, #1870) | 19.0-19.1 s | 1.22 / 1.26 | 612-632 | 172 ms | 161 | 23 | 12 | 26 | 23 |
+| `COLI_CUDA_CHAIN=1` | 17.7-17.9 s | 1.41 / 1.43 | 526-535 | 74 ms (the chain waits 68) | in the chain | in the chain | in the chain | 10 | 0.4 |
+
+The chain takes the whole dense part at once (-15 % per token, 1.2 s off the first token);
+the token stays the experts': about 1 s of expert reads per forward (24,576 FP8 experts
+behind a 4 GiB trunk on 8 GB) and 290 ms of routed experts, which no chain touches. The
+chain uploads 174 MiB itself (the matrices the placer never sees) and holds 381 MiB of
+state (the K/V, index-key and pooled-key mirrors, the DeltaNet state, the PLE ring).
+
 `tests/test_qwen38_cuda_chain.c` (`make qwen38-cuda-chain-check`, in CI beside
 `qwen38-dn-gpu-check`) runs the tiny FP8 fixture's oracle on the fake tier with the
 chain's ops from the fake's host-side table: the chain on (8/8 tokens, cosine 0.99998), a

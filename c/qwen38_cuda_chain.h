@@ -791,7 +791,7 @@ static int q38cc_forward(Model *m, const int *ids, int S, int pos_base, int nlog
     memcpy(logit, cc_ptr(ch->outd), (size_t)nlogits * V * sizeof(float));
     ch->snap_valid = snapped;
     ch->forwards++;
-    if (S == 1) { ch->dec_n++; ch->dec_wait_ms += ch->wait_ms - w0; ch->dec_host_ms += ch->host_ms - h0; }
+    if (S <= Q38_SPEC_ROWS) { ch->dec_n++; ch->dec_wait_ms += ch->wait_ms - w0; ch->dec_host_ms += ch->host_ms - h0; }   /* a decode step, or a verify's */
     return 1;
 lost:   /* a frame failed: the device is gone (or would not take a command); the CPU takes over */
     if (!cc_lost()) cc_finish();
@@ -804,7 +804,7 @@ static void q38cc_report(Model *m) {
     if (!ch || !ch->ok || !ch->forwards) return;
     CcStats st; cc_stats(&st);
     fprintf(stderr, "[chain] qwen38: %llu forwards, %llu frames (%llu ops, %llu matmuls), %.1f ms waiting for the device, "
-                    "%.1f ms of routed experts on the host, %.1f MiB on the device; per decode token %.2f ms waiting, %.2f ms of experts (%llu tokens)\n",
+                    "%.1f ms of routed experts on the host, %.1f MiB on the device; per decode step %.2f ms waiting, %.2f ms of experts (%llu steps)\n",
             ch->forwards, st.frames, st.ops, st.matmuls, ch->wait_ms, ch->host_ms, st.dev_bytes / 1048576.0,
             ch->dec_n ? ch->dec_wait_ms / ch->dec_n : 0.0, ch->dec_n ? ch->dec_host_ms / ch->dec_n : 0.0, ch->dec_n);
 }
