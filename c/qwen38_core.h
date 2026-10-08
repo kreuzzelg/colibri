@@ -80,6 +80,7 @@ typedef struct {
     int vk_res;                    /* COLI_VULKAN=1: a resident matrix (q38_load_weight), never an expert slot that is refilled in place */
     char *vk_name;                 /* COLI_VULKAN=1: its tensor's name, to read it back from disk (q38_dho_reload) */
     int vk_fmt, vk_gone;           /* dense weights on the device only (COLI_VK_DENSE_HOST): the device copy's format, and 1 while no host copy is kept */
+    void *cc;                      /* COLI_CUDA_CHAIN: the chain's own device copy of a matrix the tier did not place (qwen38_cuda_chain.h) */
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -257,6 +258,9 @@ typedef struct {
 #ifdef COLI_VULKAN
     void *vkchain;                 /* the dense chain's device state (qwen38_chain.h), NULL until it runs */
     void *vkchain2;                /* its layers on COLI_VK_DEV2's device, after the primary's (qwen38_chain.h) */
+#endif
+#ifdef COLI_CUDA
+    void *cchain;                  /* the CUDA dense chain's device state (qwen38_cuda_chain.h), NULL until it runs */
 #endif
 } Model;
 
@@ -2780,8 +2784,10 @@ static void q38_tier_start(Model *m,int cap) {
          * on one card, the conv ring, the recurrence and the gated norm go there
          * too, and a decode token runs the layer end to end on the device
          * (qwen36 measured 8 of 39 ms/token in these round trips). */
-        const char *dg=getenv("Q38_DN_GPU");
-        if(dg&&dg[0]=='1'&&!dg[1]){
+        const char *dg=getenv("Q38_DN_GPU"),*cc=getenv("COLI_CUDA_CHAIN");
+        if(cc&&cc[0]=='1'&&dg&&dg[0]=='1')
+            fprintf(stderr,"[dn] qwen38: COLI_CUDA_CHAIN=1 runs the DeltaNet layers inside the chain; Q38_DN_GPU's per-layer step is not set up beside it\n");
+        if(dg&&dg[0]=='1'&&!dg[1]&&!(cc&&cc[0]=='1')){
             int n=0; double vram=0;
             for(int i=0;i<c->layers;i++){
                 Layer *L=&m->L[i];
@@ -3209,6 +3215,9 @@ static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out)
 #ifdef COLI_VULKAN
 #include "qwen38_chain.h"  /* COLI_VK_CHAIN: every layer's dense chain on the device */
 #endif
+#ifdef COLI_CUDA
+#include "qwen38_cuda_chain.h"  /* COLI_CUDA_CHAIN: every layer's dense chain on the CUDA device */
+#endif
 
 static void reset_recurrent(Model *m) {
     kv_prefix_clear(&m->kvp);
@@ -3222,6 +3231,9 @@ static void reset_recurrent(Model *m) {
     q38_dn_gpu_invalidate(m);       /* zeros on the host are the truth; the card re-loads before its next step */
 #ifdef COLI_VULKAN
     q38c_host_wrote(m,1);           /* zeros: the dense chain fills its copy with zeros */
+#endif
+#ifdef COLI_CUDA
+    q38cc_host_wrote(m,1);
 #endif
 }
 
@@ -3328,12 +3340,13 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
     }
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
     int first=0;   /* the layers a partial dense chain ran on the device (COLI_VULKAN) */
+    float *chain_logit=NULL;   /* the Vulkan or the CUDA chain ran the final mixer and lm_head */
+    (void)chain_logit;
 #ifdef COLI_VULKAN
     /* COLI_VK_CHAIN: the layers, the final mixer and lm_head on the device; the streams
      * come back for the MTP head, every row's mixed for the prefill read-out. A partial
      * chain runs its first N layers there and hands the streams back after layer N-1:
      * the CPU runs the other layers and the head from them, below. */
-    float *chain_logit=NULL;
     if(g_vk_chain){
         int echo=g_echo_k>0&&g_echo_id&&S>1;
         chain_logit=falloc((int64_t)nlogits*c->vocab);
@@ -3357,23 +3370,38 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
             }
         }
     }
-    if(!chain_logit){
 #endif
+#ifdef COLI_CUDA
+    /* COLI_CUDA_CHAIN: the same on the CUDA device (qwen38_cuda_chain.h), every layer */
+    if(g_cuda_chain&&!chain_logit){
+        int echo=g_echo_k>0&&g_echo_id&&S>1;
+        chain_logit=falloc((int64_t)nlogits*c->vocab);
+        int took=q38cc_forward(m,ids,S,pos_base,nlogits,hyper,streams!=NULL,echo?mixed:NULL,chain_logit);
+        if(took){
+            free(m->ple_pref); m->ple_pref=NULL; m->ple_pref_rows=0;   /* consumed, as q38_layer_forward does */
+        } else {
+            free(chain_logit); chain_logit=NULL;
+            q38cc_cpu_step(m,pos_base);
+            for(int s=0;s<S;s++){
+                float *e=hyper+(int64_t)s*W;
+                q38_embed_row(m,ids[s],pos_base+s,e);
+                for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
+            }
+        }
+    }
+#endif
+    if(!chain_logit){
     for(int i=first;i<c->layers;i++)
         q38_layer_forward(m,i,hyper,ids,S,pos_base,mixed,inject,block);
     q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);
-#ifdef COLI_VULKAN
     }
-#endif
     m->kv_len=pos_base+S;
     /* Rewinding and writing a shorter branch invalidates its old tail. */
     if(m->kvp.len>pos_base)m->kvp.len=pos_base;
     kv_prefix_record(&m->kvp,ids,pos_base,S);
     if(m->vis_map && m->vis_rows_n>0)kv_prefix_taint(&m->kvp);
     float *logit;
-#ifdef COLI_VULKAN
     if(chain_logit)logit=chain_logit; else
-#endif
     logit=falloc((int64_t)nlogits*c->vocab);
     double phase_started=now_s();
     /* Lettura del prefill: la posizione p predice il token p+1. Il primo token
@@ -3383,18 +3411,14 @@ static float *q38_forward(Model *m,const int *ids,int S,int pos_base,int nlogits
         if(g_echo_pin_logit)
             q38_echo(g_echo_id,pos_base,ids[0],g_echo_pin_logit,c->vocab,g_echo_k);
         float *elog=logit;
-#ifdef COLI_VULKAN
         if(chain_logit)elog=falloc(c->vocab);   /* logit already holds the chain's last rows */
-#endif
         for(int p=0;p+1<S;p++){
             q38_weight_matmul(elog,mixed+(int64_t)p*H,&m->lm_head,1,H,c->vocab);
             q38_echo(g_echo_id,pos_base+p+1,ids[p+1],elog,c->vocab,g_echo_k);
         }
         if(elog!=logit)free(elog);
     }
-#ifdef COLI_VULKAN
     if(!chain_logit)
-#endif
     q38_weight_matmul(logit,mixed+(int64_t)(S-nlogits)*H,&m->lm_head,nlogits,H,c->vocab);
     q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);
     if(streams)*streams=hyper; else free(hyper);
@@ -3784,6 +3808,9 @@ static void q38_spec_rollback(Model *m,int len,int keep) {
     Cfg *c=&m->c; int slot=keep-1;
 #ifdef COLI_VULKAN
     q38c_rollback(m,slot,len);   /* the dense chain's own copies: its device buffers swap too */
+#endif
+#ifdef COLI_CUDA
+    q38cc_rollback(m,slot,len);
 #endif
     for(int i=0;i<c->layers;i++)if(!c->is_attn[i]){
         float *t=m->DN_rec[i];m->DN_rec[i]=m->snap_rec[slot][i];m->snap_rec[slot][i]=t;

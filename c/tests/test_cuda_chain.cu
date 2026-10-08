@@ -135,6 +135,70 @@ static void ref_ew(float *Y, const float *A, const float *B, const float *Cc, co
     }
 }
 
+static void ref_qsa(const float *src, const float *w, float *pk, const float *cs, float *sc, int *sel, const CcQsa *p) {
+    if (p->mode == 0) {
+        for (int bi = 0; bi < p->nb; bi++) {
+            int b = p->b0 + bi; float pool[256], ss = 0.f;
+            for (int d = 0; d < p->ID; d++) { float v = 0.f; for (int r = 0; r < p->R; r++) v += src[p->src_off + (b * p->R + r) * p->ID + d] / (float)p->R; pool[d] = v; ss += v * v; }
+            float rr = 1.f / sqrtf(ss / (float)p->ID + p->eps);
+            for (int d = 0; d < p->ID; d++) pool[d] = pool[d] * rr * (1.f + w[p->w_off + d]);
+            int cb = bi * 2 * p->half_;
+            for (int d = 0; d < p->ID; d++) {
+                float v = pool[d];
+                if (d < p->half_) { float c = cs[cb + 2 * d], sn = cs[cb + 2 * d + 1]; v = pool[d] * c - pool[d + p->half_] * sn; }
+                else if (d < 2 * p->half_) { int j = d - p->half_; float c = cs[cb + 2 * j], sn = cs[cb + 2 * j + 1]; v = pool[d] * c + pool[j] * sn; }
+                pk[p->pk_off + b * p->ID + d] = v;
+            }
+        }
+        return;
+    }
+    for (int s = 0; s < p->S; s++) {
+        int visible = p->pos_base + s + 1, blocks = visible / p->R, take = blocks < p->budget / p->R ? blocks : p->budget / p->R, lb = s * p->sel_row;
+        if (take >= blocks) { sel[lb] = -1; continue; }
+        int sb = s * 2 * p->nbmax, qb = p->q_off + s * p->q_row;
+        for (int b = 0; b < blocks; b++) { float score = 0.f; for (int h = 0; h < p->IQ; h++) { float a = 0.f; for (int d = 0; d < p->ID; d++) a += src[qb + h * p->ID + d] * pk[p->pk_off + b * p->ID + d]; if (a > 0.f) score += a; } sc[sb + b] = score / sqrtf((float)p->ID); }
+        for (int b = 0; b < blocks; b++) { float v = sc[sb + b]; int rank = 0; for (int b2 = 0; b2 < blocks; b2++) { float v2 = sc[sb + b2]; if (v2 > v || (v2 == v && b2 < b)) rank++; } sc[sb + p->nbmax + b] = rank < take ? 1.f : 0.f; }
+        int n = 0;
+        for (int b = 0; b < blocks; b++) if (sc[sb + p->nbmax + b] != 0.f) for (int r = 0; r < p->R; r++) sel[lb + 1 + n++] = b * p->R + r;
+        for (int t = blocks * p->R; t < visible; t++) sel[lb + 1 + n++] = t;
+        sel[lb] = n;
+    }
+}
+static void ref_ple(const float *keys, float *hyp, const float *val, const float *prm, float *gated, float *normv, const float *conv, float *ring, const CcPle *p) {
+    int W = p->C * p->H;
+    if (p->mode == 0) {
+        for (int g = 0; g < p->S * p->C; g++) {
+            int s = g / p->C, k = g - s * p->C, kb = p->keys_off + s * W + k * p->H, hb = p->hyp_off + s * W + k * p->H, vb = p->val_off + s * p->H;
+            int wk = p->prm_off + k * p->H, wq = p->prm_off + W + k * p->H, wc = p->prm_off + 2 * W + k * p->H;
+            float a = 0.f, b = 0.f;
+            for (int d = 0; d < p->H; d++) { float u = keys[kb + d], v = hyp[hb + d]; a += u * u; b += v * v; }
+            float rk = 1.f / sqrtf(a / (float)p->H + p->eps), rq = 1.f / sqrtf(b / (float)p->H + p->eps), dt = 0.f;
+            for (int d = 0; d < p->H; d++) dt += (keys[kb + d] * rk * (1.f + prm[wk + d])) * (hyp[hb + d] * rq * (1.f + prm[wq + d]));
+            float dot = dt / sqrtf((float)p->H), shaped = (dot > 0.f ? 1.f : dot < 0.f ? -1.f : 0.f) * sqrtf(fmaxf(fabsf(dot), 1e-6f));
+            if (dot == 0.f) shaped = sqrtf(1e-6f);
+            float gt = sig(shaped), c3 = 0.f;
+            for (int d = 0; d < p->H; d++) { float u = gt * val[vb + d]; gated[s * W + k * p->H + d] = u; c3 += u * u; }
+            float rc = 1.f / sqrtf(c3 / (float)p->H + p->eps);
+            for (int d = 0; d < p->H; d++) normv[s * W + k * p->H + d] = gated[s * W + k * p->H + d] * rc * (1.f + prm[wc + d]);
+        }
+        return;
+    }
+    int SL = (p->CK - 1) * p->NG;
+    for (int d = 0; d < W; d++) {
+        float rg[32] = {0}; for (int t = 0; t < SL; t++) rg[t] = ring[p->ring_off + d * SL + t];
+        int cw = p->conv_off + d * p->CK; float wl = conv[cw + p->CK - 1];
+        for (int s = 0; s < p->S; s++) {
+            float nv = normv[s * W + d], a = wl * nv;
+            for (int t = 0; t < p->CK - 1; t++) a += conv[cw + t] * rg[t * p->NG < 32 ? t * p->NG : 0];
+            hyp[p->hyp_off + s * W + d] += gated[s * W + d] + a * sig(a);
+            for (int t = 0; t + 1 < SL; t++) rg[t] = rg[t + 1];
+            if (SL > 0) rg[SL - 1] = nv;
+            if (s == p->snap_row) for (int t = 0; t < SL; t++) ring[p->snap_off + d * SL + t] = rg[t];
+        }
+        for (int t = 0; t < SL; t++) ring[p->ring_off + d * SL + t] = rg[t];
+    }
+}
+
 /* ---- helpers --------------------------------------------------------------------- */
 static CcBuf *up(const std::vector<float> &v, int kind = CC_DEV) {
     CcBuf *b = T->buf(v.size() * 4, kind);
@@ -305,6 +369,47 @@ int main(void) {
             ck(ok && maxdiff(down(yb, y0.size()).data(), ref.data(), (size_t)p.n) < 1e-5, cases[k].what);
         }
         T->free(ab); T->free(bb); T->free(cb); T->free(eb); T->free(yb);
+    }
+    printf("qsa\n");
+    {
+        const int ID = 32, R = 4, nb = 7, half = 8, IQ = 3, S = 3, pos_base = 25, budget = 12, nbmax = 16, selrow = 1 + budget + R - 1;
+        std::vector<float> ik = rnd((size_t)(nb + 2) * R * ID, 91), w = rnd(ID, 92), cs((size_t)nb * 2 * half), pk((size_t)nbmax * ID), rpk = pk;
+        for (int b = 0; b < nb; b++) for (int j = 0; j < half; j++) { float ang = (float)(b * R) / powf(10000.f, (float)(2 * j) / (2 * half)); cs[(b * half + j) * 2] = cosf(ang); cs[(b * half + j) * 2 + 1] = sinf(ang); }
+        CcQsa p0 = {0, ID, R, 0, half, 0, 0, 0, 0, 0, 0, 0, 0, 1e-6f, 0, 0, 0, nb};
+        ref_qsa(ik.data(), w.data(), rpk.data(), cs.data(), NULL, NULL, &p0);
+        CcBuf *ib = up(ik), *wb = up(w), *cb = up(cs, CC_UP), *pb = T->buf(pk.size() * 4, CC_DEV);
+        ck(T->begin() && T->qsa(ib, wb, pb, cb, NULL, NULL, &p0) && T->submit(1) && maxdiff(down(pb, pk.size()).data(), rpk.data(), (size_t)nb * ID) < 1e-5, "seven pooled block keys, normalized and rotated");
+        std::vector<float> iq = rnd((size_t)S * (IQ + 1) * ID, 93), sc((size_t)S * 2 * nbmax), rsc = sc; std::vector<int> sel((size_t)S * selrow), rsel = sel;
+        CcQsa p1 = {1, ID, R, 0, 0, S, pos_base, budget, IQ, 0, (IQ + 1) * ID, nbmax, selrow, 1e-6f, 0, 0, 0, 0};
+        ref_qsa(iq.data(), NULL, rpk.data(), NULL, rsc.data(), rsel.data(), &p1);
+        CcBuf *qb = up(iq), *sb = T->buf(sc.size() * 4, CC_DEV), *lb = T->buf(sel.size() * 4, CC_DEV);
+        int ok = T->begin() && T->qsa(qb, NULL, pb, NULL, sb, lb, &p1) && T->submit(1);
+        std::vector<int> got(sel.size()); ok = ok && T->read(lb, 0, got.data(), got.size() * 4);
+        int same = 1; for (size_t i = 0; i < got.size(); i++) if (got[i] != rsel[i]) same = 0;
+        ck(ok && same, "three rows' selections: the taken blocks' positions, then the tail, as the CPU sorts");
+        CcQsa p2 = p1; p2.pos_base = 5;   /* every block taken: the causal range */
+        ref_qsa(iq.data(), NULL, rpk.data(), NULL, rsc.data(), rsel.data(), &p2);
+        ok = T->begin() && T->qsa(qb, NULL, pb, NULL, sb, lb, &p2) && T->submit(1) && T->read(lb, 0, got.data(), got.size() * 4);
+        ck(ok && got[0] == -1 && got[selrow] == -1 && got[2 * selrow] == -1, "few positions: every row attends to all of them (-1)");
+        T->free(ib); T->free(wb); T->free(cb); T->free(pb); T->free(qb); T->free(sb); T->free(lb);
+    }
+    printf("ple\n");
+    {
+        const int S = 3, C = 4, H = 24, W = C * H, CK = 3, NG = 3, SL = (CK - 1) * NG;
+        std::vector<float> keys = rnd((size_t)S * W, 101), hyp = rnd((size_t)S * W, 102), val = rnd((size_t)S * H, 103), prm = rnd(3 * W, 104, 0.2f);
+        std::vector<float> conv = rnd((size_t)W * CK, 105, 0.5f), ring = rnd((size_t)2 * W * SL, 106), gated((size_t)S * W), normv((size_t)S * W);
+        std::vector<float> rh = hyp, rg = gated, rn = normv, rr = ring;
+        CcPle g = {0, S, C, H, CK, NG, 0, 0, 0, -1, 0, 1e-6f, 0, 0, 0};
+        ref_ple(keys.data(), rh.data(), val.data(), prm.data(), rg.data(), rn.data(), NULL, NULL, &g);
+        CcBuf *kb = up(keys), *hb = up(hyp), *vb = up(val), *pb = up(prm), *gb = T->buf(gated.size() * 4, CC_DEV), *nb = T->buf(normv.size() * 4, CC_DEV);
+        CcBuf *cb = up(conv), *rb = up(ring);
+        ck(T->begin() && T->ple(kb, hb, vb, pb, gb, nb, NULL, NULL, &g) && T->submit(1) &&
+           maxdiff(down(gb, gated.size()).data(), rg.data(), gated.size()) < 1e-5 && maxdiff(down(nb, normv.size()).data(), rn.data(), normv.size()) < 1e-5, "the gate over twelve (row, stream) pairs");
+        CcPle cv = {1, S, C, H, CK, NG, 0, 0, 0, 1, W * SL, 1e-6f, 0, 0, 0};
+        ref_ple(NULL, rh.data(), NULL, NULL, rg.data(), rn.data(), conv.data(), rr.data(), &cv);
+        ck(T->begin() && T->ple(NULL, hb, NULL, NULL, gb, nb, cb, rb, &cv) && T->submit(1) &&
+           maxdiff(down(hb, hyp.size()).data(), rh.data(), hyp.size()) < 1e-5 && maxdiff(down(rb, ring.size()).data(), rr.data(), ring.size()) < 1e-6, "the dilated convolution, the ring carried, the copy after row 1");
+        T->free(kb); T->free(hb); T->free(vb); T->free(pb); T->free(gb); T->free(nb); T->free(cb); T->free(rb);
     }
     printf("lost\n");
     {

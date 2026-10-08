@@ -289,6 +289,154 @@ __global__ static void __launch_bounds__(128) cc_dnrec_k(const float *__restrict
     }
 }
 __device__ static float cc_sig(float x) { return 1.f / (1.f + expf(-x)); }
+/* chain_qsa.comp: mode 0 one block of 128 per block key; mode 1 one block per query row */
+__global__ static void __launch_bounds__(128) cc_qsa_k(const float *__restrict__ src, const float *__restrict__ w,
+        float *__restrict__ pk, const float *__restrict__ cs, float *__restrict__ sc, int *__restrict__ sel, CcQsa p) {
+    __shared__ float pool[256];
+    __shared__ float red[128];
+    int tid = threadIdx.x;
+    if (p.mode == 0) {
+        int b = p.b0 + blockIdx.x;
+        float ss = 0.f;
+        for (int d = tid; d < p.ID; d += 128) {
+            float v = 0.f;
+            for (int r = 0; r < p.R; r++) v += src[p.src_off + (b * p.R + r) * p.ID + d] / (float)p.R;
+            pool[d] = v;
+            ss += v * v;
+        }
+        red[tid] = ss;
+        __syncthreads();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (tid < off) red[tid] += red[tid + off];
+            __syncthreads();
+        }
+        float rr = 1.f / sqrtf(red[0] / (float)p.ID + p.eps);
+        __syncthreads();
+        for (int d = tid; d < p.ID; d += 128) pool[d] = pool[d] * rr * (1.f + w[p.w_off + d]);
+        __syncthreads();
+        int cb = blockIdx.x * 2 * p.half_;
+        for (int d = tid; d < p.ID; d += 128) {
+            float v = pool[d];
+            if (d < p.half_) {
+                float c = cs[cb + 2 * d], sn = cs[cb + 2 * d + 1];
+                v = pool[d] * c - pool[d + p.half_] * sn;
+            } else if (d < 2 * p.half_) {
+                int j = d - p.half_;
+                float c = cs[cb + 2 * j], sn = cs[cb + 2 * j + 1];
+                v = pool[d] * c + pool[j] * sn;
+            }
+            pk[p.pk_off + b * p.ID + d] = v;
+        }
+        return;
+    }
+    int s = blockIdx.x;
+    int visible = p.pos_base + s + 1, blocks = visible / p.R;
+    int take = min(blocks, p.budget / p.R);
+    int lb = s * p.sel_row;
+    if (take >= blocks) {
+        if (tid == 0) sel[lb] = -1;
+        return;
+    }
+    int sb = s * 2 * p.nbmax;
+    int qb = p.q_off + s * p.q_row;
+    for (int b = tid; b < blocks; b += 128) {
+        float score = 0.f;
+        for (int h = 0; h < p.IQ; h++) {
+            float a = 0.f;
+            for (int d = 0; d < p.ID; d++) a += src[qb + h * p.ID + d] * pk[p.pk_off + b * p.ID + d];
+            if (a > 0.f) score += a;
+        }
+        sc[sb + b] = score / sqrtf((float)p.ID);
+    }
+    __threadfence_block();
+    __syncthreads();
+    for (int b = tid; b < blocks; b += 128) {
+        float v = sc[sb + b];
+        int rank = 0;
+        for (int b2 = 0; b2 < blocks; b2++) {
+            float v2 = sc[sb + b2];
+            if (v2 > v || (v2 == v && b2 < b)) rank++;
+        }
+        sc[sb + p.nbmax + b] = rank < take ? 1.f : 0.f;
+    }
+    __threadfence_block();
+    __syncthreads();
+    if (tid == 0) {
+        int n = 0;
+        for (int b = 0; b < blocks; b++)
+            if (sc[sb + p.nbmax + b] != 0.f)
+                for (int r = 0; r < p.R; r++) sel[lb + 1 + n++] = b * p.R + r;
+        for (int t = blocks * p.R; t < visible; t++) sel[lb + 1 + n++] = t;
+        sel[lb] = n;
+    }
+}
+/* chain_ple.comp: mode 0 one block of 256 per (row, stream); mode 1 one thread per channel */
+__device__ static void cc_ple_reduce2(float *r1, float *r2, int tid) {
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) { r1[tid] += r1[tid + off]; r2[tid] += r2[tid + off]; }
+        __syncthreads();
+    }
+}
+__global__ static void __launch_bounds__(256) cc_ple_k(const float *__restrict__ keys, float *__restrict__ hyp,
+        const float *__restrict__ val, const float *__restrict__ prm, float *__restrict__ gated, float *__restrict__ normv,
+        const float *__restrict__ conv, float *__restrict__ ring, CcPle p) {
+    __shared__ float r1[256];
+    __shared__ float r2[256];
+    int W = p.C * p.H, tid = threadIdx.x;
+    if (p.mode == 0) {
+        int g = blockIdx.x, s = g / p.C, k = g - s * p.C;
+        int kb = p.keys_off + s * W + k * p.H, hb = p.hyp_off + s * W + k * p.H, vb = p.val_off + s * p.H;
+        int wk = p.prm_off + k * p.H, wq = p.prm_off + W + k * p.H, wc = p.prm_off + 2 * W + k * p.H;
+        float a = 0.f, b = 0.f;
+        for (int d = tid; d < p.H; d += 256) { float u = keys[kb + d], v = hyp[hb + d]; a += u * u; b += v * v; }
+        r1[tid] = a; r2[tid] = b;
+        cc_ple_reduce2(r1, r2, tid);
+        float rk = 1.f / sqrtf(r1[0] / (float)p.H + p.eps), rq = 1.f / sqrtf(r2[0] / (float)p.H + p.eps);
+        __syncthreads();
+        float dt = 0.f;
+        for (int d = tid; d < p.H; d += 256)
+            dt += (keys[kb + d] * rk * (1.f + prm[wk + d])) * (hyp[hb + d] * rq * (1.f + prm[wq + d]));
+        r1[tid] = dt; r2[tid] = 0.f;
+        cc_ple_reduce2(r1, r2, tid);
+        float dot = r1[0] / sqrtf((float)p.H);
+        float shaped = (dot > 0.f ? 1.f : dot < 0.f ? -1.f : 0.f) * sqrtf(fmaxf(fabsf(dot), 1e-6f));
+        if (dot == 0.f) shaped = sqrtf(1e-6f);   /* copysign(x, +0) is +x */
+        float gt = cc_sig(shaped);
+        __syncthreads();
+        float c3 = 0.f;
+        for (int d = tid; d < p.H; d += 256) {
+            float u = gt * val[vb + d];
+            gated[s * W + k * p.H + d] = u;
+            c3 += u * u;
+        }
+        r1[tid] = c3; r2[tid] = 0.f;
+        cc_ple_reduce2(r1, r2, tid);
+        float rc = 1.f / sqrtf(r1[0] / (float)p.H + p.eps);
+        for (int d = tid; d < p.H; d += 256)
+            normv[s * W + k * p.H + d] = gated[s * W + k * p.H + d] * rc * (1.f + prm[wc + d]);
+        return;
+    }
+    long long d = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= W) return;
+    int SL = (p.CK - 1) * p.NG;
+    float rg[32];
+    for (int t = 0; t < 32; t++) rg[t] = t < SL ? ring[p.ring_off + d * SL + t] : 0.f;
+    int cw = p.conv_off + (int)d * p.CK;
+    float wl = conv[cw + p.CK - 1];
+    for (int s = 0; s < p.S; s++) {
+        float nv = normv[s * W + d];
+        float a = wl * nv;
+        for (int t = 0; t < 31; t++)
+            if (t < p.CK - 1) a += conv[cw + t] * rg[t * p.NG < 32 ? t * p.NG : 0];
+        hyp[p.hyp_off + s * W + d] += gated[s * W + d] + a * cc_sig(a);
+        for (int t = 0; t < 31; t++) if (t + 1 < SL) rg[t] = rg[t + 1];
+        for (int t = 0; t < 32; t++) if (t == SL - 1) rg[t] = nv;
+        if (s == p.snap_row)
+            for (int t = 0; t < 32; t++) if (t < SL) ring[p.snap_off + d * SL + t] = rg[t];
+    }
+    for (int t = 0; t < 32; t++) if (t < SL) ring[p.ring_off + d * SL + t] = rg[t];
+}
 __global__ static void cc_ew_k(float *__restrict__ y, const float *__restrict__ a, const float *__restrict__ b,
                                const float *__restrict__ c, const float *__restrict__ e, CcEw p) {
     long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -558,6 +706,7 @@ static int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *pr
     const float *a = fp(cv), *b = fp(ab), *zz = fp(z), *pr = fp(prm);
     float *s = fpw(st), *yy = fpw(y), *sn = fpw(snap);
     switch (KD) {
+    case 4:   cc_dnrec_k<4><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
     case 8:   cc_dnrec_k<8><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
     case 16:  cc_dnrec_k<16><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
     case 32:  cc_dnrec_k<32><<<(unsigned)p->VH, 128, 0, c->stream>>>(a, b, zz, s, pr, yy, sn, *p); break;
@@ -583,6 +732,30 @@ static int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *cb, CcBuf *e, const CcEw *
     cc_ew_k<<<grid1((size_t)p->n, 256), 256, 0, c->stream>>>(fpw(y), fp(a), fp(b), fp(cb), fp(e), *p);
     return launched(c, "ew");
 }
+static int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p) {
+    CcCtx *c = live();
+    if (!c || !src || !pk || !p || p->ID < 1 || p->ID > 256 || p->R < 1) return 0;
+    if (p->mode == 0) {
+        if (!w || !cs || p->nb < 1 || 2 * p->half_ > p->ID) return 0;
+        cc_qsa_k<<<(unsigned)p->nb, 128, 0, c->stream>>>(fp(src), fp(w), fpw(pk), fp(cs), nullptr, nullptr, *p);
+    } else if (p->mode == 1) {
+        if (!sc || !sel || p->S < 1 || p->IQ < 1 || p->nbmax < 1 || p->sel_row < 1) return 0;
+        cc_qsa_k<<<(unsigned)p->S, 128, 0, c->stream>>>(fp(src), nullptr, fpw(pk), nullptr, fpw(sc), (int *)sel->d, *p);
+    } else return 0;
+    return launched(c, "qsa");
+}
+static int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated, CcBuf *normv, CcBuf *conv, CcBuf *ring, const CcPle *p) {
+    CcCtx *c = live();
+    if (!c || !hyp || !gated || !normv || !p || p->S < 1 || p->C < 1 || p->H < 1) return 0;
+    if (p->mode == 0) {
+        if (!keys || !val || !prm) return 0;
+        cc_ple_k<<<(unsigned)(p->S * p->C), 256, 0, c->stream>>>(fp(keys), fpw(hyp), fp(val), fp(prm), fpw(gated), fpw(normv), nullptr, nullptr, *p);
+    } else if (p->mode == 1) {
+        if (!conv || !ring || p->CK < 2 || (p->CK - 1) * p->NG > 32) return 0;
+        cc_ple_k<<<grid1((size_t)p->C * p->H, 256), 256, 0, c->stream>>>(nullptr, fpw(hyp), nullptr, nullptr, fpw(gated), fpw(normv), fp(conv), fpw(ring), *p);
+    } else return 0;
+    return launched(c, "ple");
+}
 static void cc_stats(CcStats *st) { if (st) *st = g_st; }
 
 static const ColiCudaChainOps g_cc_ops = {
@@ -593,5 +766,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_copy, cc_zero, cc_copy_regions, cc_write, cc_read,
     cc_matmul, cc_norm, cc_rope, cc_attn, cc_dnconv, cc_dnrec, cc_ew,
     cc_stats,
+    cc_qsa, cc_ple,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

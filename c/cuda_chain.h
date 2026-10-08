@@ -68,7 +68,7 @@ typedef struct { int S, H, KVH, hd, pos_base, cap, q_off, q_row, q_seg, g_off, g
                  o_off, o_row, sel_off, sel_row; float scale; int k_off, v_off; } CcAttn;
 /* chain_dnconv.comp */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } CcDnConv;
-/* chain_dnrec.comp (KD a template parameter: 8, 16, 32, 64, 128 or 256; VD <= 128) */
+/* chain_dnrec.comp (KD a template parameter: 4, 8, 16, 32, 64, 128 or 256; VD <= 128) */
 typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a_row, z_off, z_row,
                  y_off, y_row, snap_row, flags; float eps, qscale; int st_off, snap_off, prm_off; } CcDnRec;
 /* chain_ew.comp */
@@ -82,6 +82,12 @@ typedef struct { int S, VH, KH, VD, Ktot, cv_off, cv_row, b_off, b_row, a_off, a
 #define CC_EW_SCALE    7
 #define CC_EW_GATE_ADD 8
 typedef struct { int op, n, D, C, flags, e_row, y_off, a_off, b_off, c_off, e_off; float fc; } CcEw;
+/* chain_qsa.comp (mode 0: nb block keys from b0; mode 1: S rows' selections) */
+typedef struct { int mode, ID, R, b0, half_, S, pos_base, budget, IQ, q_off, q_row, nbmax, sel_row; float eps;
+                 int src_off, w_off, pk_off, nb; } CcQsa;
+/* chain_ple.comp (mode 0: the gate over S*C (row, stream) pairs; mode 1: the convolution) */
+typedef struct { int mode, S, C, H, CK, NG, keys_off, hyp_off, val_off, snap_row, snap_off; float eps;
+                 int prm_off, conv_off, ring_off; } CcPle;
 /* one copy over n regions (a KV row per head, say); offsets and counts in floats */
 typedef struct { size_t dst, src, n; } CcRegion;
 /* counters, for the engines' [chain] lines */
@@ -126,6 +132,9 @@ typedef struct ColiCudaChainOps {
     int  (*dnrec)(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p);
     int  (*ew)(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *p);
     void (*stats)(CcStats *st);
+    /* Qwen3.8's two: the QSA indexer's block keys and selections, the PLE gate and convolution */
+    int  (*qsa)(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p);
+    int  (*ple)(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated, CcBuf *normv, CcBuf *conv, CcBuf *ring, const CcPle *p);
 } ColiCudaChainOps;
 
 /* The backend's table; NULL from a backend without the chain. Optional in the DLL
@@ -167,6 +176,8 @@ static inline int cc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf 
 static inline int cc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p) { const ColiCudaChainOps *t = cc_ops(); return t ? t->dnrec(KD, cv, ab, z, st, prm, y, snap, p) : 0; }
 static inline int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *p) { const ColiCudaChainOps *t = cc_ops(); return t ? t->ew(y, a, b, c, e, p) : 0; }
 static inline void cc_stats(CcStats *st) { const ColiCudaChainOps *t = cc_ops(); if (t) t->stats(st); else memset(st, 0, sizeof *st); }
+static inline int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p) { const ColiCudaChainOps *t = cc_ops(); return t ? t->qsa(src, w, pk, cs, sc, sel, p) : 0; }
+static inline int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated, CcBuf *normv, CcBuf *conv, CcBuf *ring, const CcPle *p) { const ColiCudaChainOps *t = cc_ops(); return t ? t->ple(keys, hyp, val, prm, gated, normv, conv, ring, p) : 0; }
 #endif
 
 #ifdef __cplusplus

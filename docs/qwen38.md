@@ -575,6 +575,52 @@ GPU step turns the layer off and the CPU continues from what the card holds.
 Opt-in; `tests/test_qwen38_dn_gpu.c` (`make qwen38-dn-gpu-check`) runs the tiny
 fixture's oracle with the layers on the fake card.
 
+### The chain on the card (`COLI_CUDA_CHAIN=1`)
+
+The CUDA twin of the Vulkan chain (`qwen38_chain.h`), on the same ops table qwen36's
+chain uses (`cuda_chain.h`, docs/qwen36-cuda-tier.md "The dense chain on the card"), in
+`qwen38_cuda_chain.h`. Per layer, one frame on the card: the previous block's MoE output
+joining the four hyper-connection streams (routed + sigmoid(gate) x shared, then
+hyper += inject x block), the gated residual's read (per-stream norm, the low-rank
+down/up pair, the stream mix, the inject weights), the gated attention with QSA (the
+index keys into the device cache, each completed block's pooled key computed once on
+the device, the indexer's top-k selection per query row, the attention over the listed
+positions with the output gate) or the Gated DeltaNet (the convolution with its ring,
+the recurrence with its state, the sigmoid-gated norm), the write-back, the second gated
+residual, the router logits; waited for. The host routes and runs the routed experts
+through the fp8 tier (`q38_moe_ex` routed only) and hands the sum up; the shared expert
+runs on the card meanwhile (frame A2). At the PLE layer the n-gram rows come from the
+host (disk reads, the history replayed as `q38_ple` does), the key and value projections,
+the gate and the dilated convolution with its ring run on the device. The last frame
+runs the final mixer and lm_head; the streams come back when the MTP head needs them.
+
+The matrices: the tier's int8 copies where the placer put them (`Q38_TRUNK_GPU`,
+`COLI_PLACE`); every other matrix of a layer, the final mixer and lm_head the chain
+uploads itself, the trunk's int8 rows when the CPU holds them (the same bits), else the
+BF16/F32 rows as f32. So the chain runs whatever the placement did; what it adds in VRAM
+are the small matrices the placer never sees (the gated residuals' low-rank pairs, the
+DeltaNet b/a rows, the PLE projections) and the state (the DeltaNet state and conv
+rings, the PLE ring, the K/V, index-key and pooled-key mirrors).
+
+State ownership as in qwen36's chain: the host's K/V and index caches canonical behind
+a watermark, the pooled block keys behind one of their own; the DeltaNet state, conv
+rings and PLE ring on the device while the chain runs, brought back before the host
+reads them (a pinned snapshot, the prefix cache) and pushed up after the host writes
+them (a reset as zeros, a restored snapshot as an upload). An MTP or prompt-lookup verify
+runs row-wise (the warp GEMV computes each row on its own: a decode step's bits) and
+copies the DeltaNet state, the conv rings and the PLE ring after each of its rows into a
+device slot; a rejected draft swaps slot r in (`q38cc_rollback`) as the CPU swaps its
+own. A lost device zeroes the state, rebuilds it on the CPU from the prefix record (the
+PLE history replayed) and runs there from then on. `Q38_DN_GPU`'s per-layer step is not
+set up beside the chain; `KV_SLOTS` > 1 keeps the chain off.
+
+`tests/test_qwen38_cuda_chain.c` (`make qwen38-cuda-chain-check`, in CI beside
+`qwen38-dn-gpu-check`) runs the tiny FP8 fixture's oracle on the fake tier with the
+chain's ops from the fake's host-side table: the chain on (8/8 tokens, cosine 0.99998), a
+frame that fails mid-run (the state rebuilt on the CPU, the run finishing there within
+the limits), and the per-matrix path. `tests/test_cuda_chain.cu` checks the QSA and PLE
+kernels on a real card against their references.
+
 ### The trunk on the CPU: int8 rows
 
 Without a GPU the same trunk is the decode's floor: 8 GiB of BF16 read on

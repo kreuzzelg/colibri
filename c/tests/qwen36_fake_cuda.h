@@ -452,12 +452,99 @@ static int fcc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *
     }
     return 1;
 }
+static int fcc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p) {
+    if (!fcc_ready() || !src || !pk || !p || p->ID > 256) return 0;
+    fake_chain_ops++;
+    if (p->mode == 0) {
+        if (!w || !cs) return 0;
+        for (int bi = 0; bi < p->nb; bi++) {
+            int b = p->b0 + bi; float pool[256], ss = 0.f;
+            for (int d = 0; d < p->ID; d++) { float v = 0.f; for (int r = 0; r < p->R; r++) v += src->d[p->src_off + (b * p->R + r) * p->ID + d] / (float)p->R; pool[d] = v; ss += v * v; }
+            float rr = 1.f / sqrtf(ss / (float)p->ID + p->eps);
+            for (int d = 0; d < p->ID; d++) pool[d] = pool[d] * rr * (1.f + w->d[p->w_off + d]);
+            int cb = bi * 2 * p->half_;
+            for (int d = 0; d < p->ID; d++) {
+                float v = pool[d];
+                if (d < p->half_) { float c = cs->d[cb + 2 * d], sn = cs->d[cb + 2 * d + 1]; v = pool[d] * c - pool[d + p->half_] * sn; }
+                else if (d < 2 * p->half_) { int j = d - p->half_; float c = cs->d[cb + 2 * j], sn = cs->d[cb + 2 * j + 1]; v = pool[d] * c + pool[j] * sn; }
+                pk->d[p->pk_off + b * p->ID + d] = v;
+            }
+        }
+        return 1;
+    }
+    if (p->mode != 1 || !sc || !sel) return 0;
+    int *S = (int *)sel->d;
+    for (int s = 0; s < p->S; s++) {
+        int visible = p->pos_base + s + 1, blocks = visible / p->R, take = blocks < p->budget / p->R ? blocks : p->budget / p->R;
+        int lb = s * p->sel_row;
+        if (take >= blocks) { S[lb] = -1; continue; }
+        int sb = s * 2 * p->nbmax, qb = p->q_off + s * p->q_row;
+        for (int b = 0; b < blocks; b++) {
+            float score = 0.f;
+            for (int h = 0; h < p->IQ; h++) { float a = 0.f; for (int d = 0; d < p->ID; d++) a += src->d[qb + h * p->ID + d] * pk->d[p->pk_off + b * p->ID + d]; if (a > 0.f) score += a; }
+            sc->d[sb + b] = score / sqrtf((float)p->ID);
+        }
+        for (int b = 0; b < blocks; b++) {
+            float v = sc->d[sb + b]; int rank = 0;
+            for (int b2 = 0; b2 < blocks; b2++) { float v2 = sc->d[sb + b2]; if (v2 > v || (v2 == v && b2 < b)) rank++; }
+            sc->d[sb + p->nbmax + b] = rank < take ? 1.f : 0.f;
+        }
+        int n = 0;
+        for (int b = 0; b < blocks; b++) if (sc->d[sb + p->nbmax + b] != 0.f) for (int r = 0; r < p->R; r++) S[lb + 1 + n++] = b * p->R + r;
+        for (int t = blocks * p->R; t < visible; t++) S[lb + 1 + n++] = t;
+        S[lb] = n;
+    }
+    return 1;
+}
+static int fcc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated, CcBuf *normv, CcBuf *conv, CcBuf *ring, const CcPle *p) {
+    if (!fcc_ready() || !hyp || !gated || !normv || !p) return 0;
+    fake_chain_ops++;
+    int W = p->C * p->H;
+    if (p->mode == 0) {
+        if (!keys || !val || !prm) return 0;
+        for (int g = 0; g < p->S * p->C; g++) {
+            int s = g / p->C, k = g - s * p->C;
+            int kb = p->keys_off + s * W + k * p->H, hb = p->hyp_off + s * W + k * p->H, vb = p->val_off + s * p->H;
+            int wk = p->prm_off + k * p->H, wq = p->prm_off + W + k * p->H, wc = p->prm_off + 2 * W + k * p->H;
+            float a = 0.f, b = 0.f;
+            for (int d = 0; d < p->H; d++) { float u = keys->d[kb + d], v = hyp->d[hb + d]; a += u * u; b += v * v; }
+            float rk = 1.f / sqrtf(a / (float)p->H + p->eps), rq = 1.f / sqrtf(b / (float)p->H + p->eps), dt = 0.f;
+            for (int d = 0; d < p->H; d++) dt += (keys->d[kb + d] * rk * (1.f + prm->d[wk + d])) * (hyp->d[hb + d] * rq * (1.f + prm->d[wq + d]));
+            float dot = dt / sqrtf((float)p->H);
+            float shaped = (dot > 0.f ? 1.f : dot < 0.f ? -1.f : 0.f) * sqrtf(fmaxf(fabsf(dot), 1e-6f));
+            if (dot == 0.f) shaped = sqrtf(1e-6f);
+            float gt = fcc_sig(shaped), c3 = 0.f;
+            for (int d = 0; d < p->H; d++) { float u = gt * val->d[vb + d]; gated->d[s * W + k * p->H + d] = u; c3 += u * u; }
+            float rc = 1.f / sqrtf(c3 / (float)p->H + p->eps);
+            for (int d = 0; d < p->H; d++) normv->d[s * W + k * p->H + d] = gated->d[s * W + k * p->H + d] * rc * (1.f + prm->d[wc + d]);
+        }
+        return 1;
+    }
+    if (p->mode != 1 || !conv || !ring || (p->CK - 1) * p->NG > 32) return 0;
+    int SL = (p->CK - 1) * p->NG;
+    for (int d = 0; d < W; d++) {
+        float rg[32] = {0};
+        for (int t = 0; t < SL; t++) rg[t] = ring->d[p->ring_off + d * SL + t];
+        int cw = p->conv_off + d * p->CK; float wl = conv->d[cw + p->CK - 1];
+        for (int s = 0; s < p->S; s++) {
+            float nv = normv->d[s * W + d], a = wl * nv;
+            for (int t = 0; t < p->CK - 1; t++) a += conv->d[cw + t] * rg[t * p->NG < 32 ? t * p->NG : 0];
+            hyp->d[p->hyp_off + s * W + d] += gated->d[s * W + d] + a * fcc_sig(a);
+            for (int t = 0; t + 1 < SL; t++) rg[t] = rg[t + 1];
+            if (SL > 0) rg[SL - 1] = nv;
+            if (s == p->snap_row) for (int t = 0; t < SL; t++) ring->d[p->snap_off + d * SL + t] = rg[t];
+        }
+        for (int t = 0; t < SL; t++) ring->d[p->ring_off + d * SL + t] = rg[t];
+    }
+    return 1;
+}
 static void fcc_stats(CcStats *st) { memset(st, 0, sizeof *st); st->frames = (unsigned long long)fake_chain_frames; st->ops = (unsigned long long)fake_chain_ops; st->dev_bytes = fake_chain_dev_bytes; }
 static const ColiCudaChainOps fake_chain_table = {
     sizeof(ColiCudaChainOps), fcc_init, fcc_ready, fcc_lost, fcc_shutdown, fcc_device, fcc_device_now,
     fcc_buf, fcc_free, fcc_reserve, fcc_ptr, fcc_bytes, fcc_begin, fcc_submit, fcc_finish,
     fcc_copy, fcc_zero, fcc_copy_regions, fcc_write, fcc_read,
     fcc_matmul, fcc_norm, fcc_rope, fcc_attn, fcc_dnconv, fcc_dnrec, fcc_ew, fcc_stats,
+    fcc_qsa, fcc_ple,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }

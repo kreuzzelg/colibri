@@ -1462,6 +1462,9 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
 #ifdef COLI_VULKAN
     if (to_state) q38c_sync_host(m);   /* the dense chain keeps the newest state on the device */
 #endif
+#ifdef COLI_CUDA
+    if (to_state) q38cc_sync_host(m);
+#endif
     if (!q38_prefix_geometry(m, &rec, &conv, &ple)) return 0;
     Q38PinState *st = *slot;
     if (st && st->n_layers != c->layers){ q38_pin_state_free(st); st = NULL; }
@@ -1514,6 +1517,9 @@ static int q38_pin_state_copy(Model *m, Q38PinState **slot, int to_state){
     if (!to_state) q38_dn_gpu_invalidate(m);   /* restored on the host: the card's copy is from another prompt */
 #ifdef COLI_VULKAN
     if (!to_state) q38c_host_wrote(m, 0);   /* up to the device before the next chain step */
+#endif
+#ifdef COLI_CUDA
+    if (!to_state) q38cc_host_wrote(m, 0);
 #endif
     return 1;
 }
@@ -1618,6 +1624,10 @@ static void q38_prefix_copy_state(Model *m,int to_cache){
 #ifdef COLI_VULKAN
     if(to_cache)q38c_sync_host(m);
     else q38c_host_wrote(m,0);
+#endif
+#ifdef COLI_CUDA
+    if(to_cache)q38cc_sync_host(m);
+    else q38cc_host_wrote(m,0);
 #endif
     for(int i=0;i<m->c.layers;i++)if(!m->c.is_attn[i]){
         float *rec=to_cache?g_q38_prefix.dn_rec[i]:m->DN_rec[i];
@@ -2198,6 +2208,9 @@ static void serve_loop(Model *m){
         if(r<0){q38_prefix_cache_release(m);return;}
         if(r==2){
             int status=serve_one(m,&q);free(q.payload);
+#ifdef COLI_CUDA
+            q38cc_report(m);
+#endif
 #ifdef COLI_VULKAN
             q38_vk_report();   /* stderr: the wire protocol on stdout is untouched */
             q38c_report(m);
@@ -2374,6 +2387,12 @@ int main(int argc, char **argv) {
                 g_q38_mux_slots);
     }
     q38_trunk_cpu_int8(&m);    /* the trunk's int8 rows on the CPU, BF16 released (Q38_TRUNK_CPU_INT8=0 keeps BF16) */
+#ifdef COLI_CUDA
+    /* COLI_CUDA_CHAIN=1: every layer on the device as one chain (qwen38_cuda_chain.h), set up
+     * now that the tier placed the trunk and the CPU holds its int8 rows (the chain's own
+     * copies of the rest come from the same bytes) */
+    if (q38cc_env_on() && q38cc_setup(&m, g_q38_mux_slots)) { g_cuda_chain=1; atexit(cc_shutdown); }
+#endif
     q38_expert_report(&m, cap);         /* expert format, bytes per expert, what the cache costs */
 #ifdef COLI_VULKAN
     /* After the trunk is int8: those rows upload at their first matmul. No
@@ -2434,6 +2453,9 @@ int main(int argc, char **argv) {
         printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
                (unsigned long long)m.hits, (unsigned long long)m.miss);
         printf("Speed: %.2f tok/s (%.1fs for %d tokens) | PEAK RSS: %.2f GB\n", scored/dt, dt, scored, rss_gb());
+#ifdef COLI_CUDA
+        q38cc_report(&m);
+#endif
 #ifdef COLI_VULKAN
         q38_vk_report();
         q38c_report(&m);
@@ -2518,6 +2540,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
+#ifdef COLI_CUDA
+    q38cc_report(&m);
+#endif
 #ifdef COLI_VULKAN
     q38_vk_report();
     q38c_report(&m);

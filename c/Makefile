@@ -527,7 +527,7 @@ TEST_EXCLUDE = test_uring test_deepseek_v4 test_v4_ownership test_v4_serve_frami
 	test_segment_adapters_registration test_segment_adapters_real \
 	test_edge_adapters_registration test_edge_adapters_real \
 	test_xdna_execution test_xdna_failure \
-	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu \
+	test_gsgemv_sse41 test_qgemv_sse41 test_olmoe_dot_i8_16_sse41 test_st_f16_bf16_simd_sse41 test_qwen38_tier_engine test_qwen38_dn_gpu test_qwen38_cuda_chain \
 	test_e8x4g64_loader test_qwenimage_vae test_vk_tier \
 	test_i4_grouped_sse41 test_i4_grouped_sse41_o1 test_i4_grouped_sse41_no_contract
 TEST_EXCLUDE += test_vk_chain test_glm53_vk_f32
@@ -1501,7 +1501,7 @@ qwen38-tiny-check: qwen38-tiny-generate qwen38$(EXE)
 # plus BF16 128x128 block scales, gate/up and down in separate shards. The
 # native slab path and the expanded path must both reproduce the reference;
 # then the engine runs on the fake CUDA tier (no toolkit, no GPU).
-.PHONY: qwen38-tiny-fp8-generate qwen38-tiny-fp8-check qwen38-tier-engine-check
+.PHONY: qwen38-tiny-fp8-generate qwen38-tiny-fp8-check qwen38-tier-engine-check qwen38-cuda-chain-check
 qwen38-tiny-fp8-generate:
 	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny_fp8 --fp8-experts
 
@@ -1517,6 +1517,9 @@ qwen38-tier-engine-check: qwen38-tiny-fp8-generate tests/test_qwen38_tier_engine
 
 qwen38-dn-gpu-check: qwen38-tiny-fp8-generate tests/test_qwen38_dn_gpu$(EXE)
 	./tests/test_qwen38_dn_gpu$(EXE)
+
+qwen38-cuda-chain-check: qwen38-tiny-fp8-generate tests/test_qwen38_cuda_chain$(EXE)
+	./tests/test_qwen38_cuda_chain$(EXE)
 
 # The routed experts as int4-g64: tools/convert_qwen38_experts_int4.py writes
 # the experts-int4g64/ sidecar next to the FP8 shards and qwen38 picks it up.
@@ -2665,6 +2668,11 @@ tests/test_qwen38_tier_engine$(EXE): tests/test_qwen38_tier_engine.c qwen38.c qw
 
 # Q38_DN_GPU=1 on the tiny FP8 fixture (fake backend, oracle): runs from qwen38-dn-gpu-check.
 tests/test_qwen38_dn_gpu$(EXE): tests/test_qwen38_dn_gpu.c qwen38.c qwen36_tier.c $(VK_OBJ)
+	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
+
+# Qwen3.8's layers as one chain on the card (COLI_CUDA_CHAIN=1): the tiny FP8 fixture's oracle
+# on the fake tier, the chain's ops from the fake's host-side table (qwen38_cuda_chain.h).
+tests/test_qwen38_cuda_chain$(EXE): tests/test_qwen38_cuda_chain.c qwen38.c qwen36_tier.c $(VK_OBJ)
 	$(CC) $(CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(LDFLAGS)
 
 tests/test_serve_poll$(EXE): tests/test_serve_poll.c
