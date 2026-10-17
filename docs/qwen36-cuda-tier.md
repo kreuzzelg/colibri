@@ -386,6 +386,23 @@ part of a token fell from 9.8 ms (the tier's issue 0.8, the CPU's misses 4.6, th
 residents now on its stream. The text is the same as the host path's for the first 150
 characters and diverges afterwards, as two runs with a different order of the K summands do.
 
+**A decode token's frames as graphs** (`COLI_CUDA_CHAIN_GRAPH`, on by default). Frame A1 of a
+layer is about fifteen launches; a decode token issues six hundred of them and waits forty
+times. The chain captures each layer's A1 once, at the first decode token (`cc_graph_begin`
+.. `cc_graph_end` around the same ops, nothing runs meanwhile), and launches the graph from
+then on. What changes between tokens is read from buffers: the position from a four-int
+buffer the host writes per token (the attention's `pos_dyn`, the `kvput` op that puts the
+new K/V rows into the caches -- one launch instead of a copy per head), the RoPE table and
+the routed sum as before. A graph names its buffers, so it is dropped when one moves (a
+larger scratch, a regrown KV mirror) or when the route changes what the combine adds; a
+rejected draft's rollback copies the state back instead of swapping the buffers. Prompts,
+verifies (other row counts, the state copies) and layer dumps run op by op. Measured on
+the 3070: 16.4 -> 16.0 ms a decode token. The host's launch time went (about 1.3 ms), but
+the device's wait grew by nearly as much: the token is the device's now, 9 ms of it, the
+trunk's 1.9 GB of rows, the residents' 435 MB and some four hundred small kernels at their
+few-microsecond floor each, and the CPU's misses (5 ms, overlapping the device only in
+part). The next lever is on the device: fusing the small kernels of a layer, and the hits.
+
 **What it needs.** Every projection of every layer, the shared expert's three matrices
 and lm_head on one card: `COLI_CUDA_CHAIN=1` offers the shared expert to the placer
 (what `Q36_OFFER_SHEXP=1` does) and `COLI_PLACE=auto` takes the whole 35B trunk on an
@@ -436,6 +453,7 @@ expert tier at 81-82 % hits, the usual 49-token prompt, 200 new tokens, two runs
 | `Q36_DN_GPU=1` (the per-layer step) | 1.22-1.26 s | 26.2-27.6 | 30-32 | 32-33 | |
 | `COLI_CUDA_CHAIN=1`, the residents through the host path | 0.98-1.05 s | 41.6-42.8 | 18.7-18.9 | 53 | 5.7-6.1 ms |
 | `COLI_CUDA_CHAIN=1`, the residents on the chain's stream (`COLI_CUDA_CHAIN_EXPERTS`) | 0.81-0.82 s | 48.6-48.9 | 16.4-16.6 | 61 | 7.8 ms |
+| and the frames as graphs (`COLI_CUDA_CHAIN_GRAPH`) | 0.82 s | 49.7-50.0 | 16.0-16.1 | 62 | 8.9-9.0 ms |
 | Ollama 0.34.4 on the same card | | | 26.2 | 38.1 | |
 
 The chain alone, with the backend's block GEMV, gave 27.6 ms a token: the CPU's parts

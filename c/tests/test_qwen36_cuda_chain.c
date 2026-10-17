@@ -195,6 +195,8 @@ int main(void) {
     ck(maxdiff(m.DN_rec[0], ref.DN_rec[0], (size_t)VH * KD * VD) < 1e-3 && maxdiff(m.DN_conv[0], ref.DN_conv[0], (size_t)CD * (CONVK - 1)) < 1e-4,
        "the state read back from the device equals the CPU path's");
     ck(ch->xdev && ch->xdev_experts > 0 && !ch->xdev_refused, "the residents of the decode tokens ran through the route (the fake's experts op)");
+    ck(ch->graph && fake_graphs == NL && fake_graph_launches == 3 * NL && ch->graph_captures == (unsigned)NL,
+       "the first decode token captured a frame per layer, the two after it launched them (the fake replays the recorded ops)");
     { CcStats st; cc_stats(&st); ck(st.experts == ch->xdev_experts, "the table counted them"); }
     ck(ch->dn_where == Q36CC_BOTH, "both sides hold it now");
 
@@ -231,6 +233,7 @@ int main(void) {
     lc = step_ex(&m, ids + 7, 1, 7, 1); m.kv_len = 8;
     same_logits(lc, lr, V, "after the rollback the next token continues from the state after row 0");
     free(lr); free(lc);
+    { char b[160]; snprintf(b, sizeof b, "the tokens after the reset, the CPU step and the rollback launched the same graphs (%d launches, the state copied back, not swapped)", fake_graph_launches); ck(fake_graph_launches == 5 * NL && fake_graphs == NL, b); }
 
     printf(" D. a frame that fails: the state rebuilt on the CPU, the step and the rest there\n");
     q36cc_sync_host(&ref);   /* no chain on the reference: a no-op */
@@ -258,6 +261,12 @@ int main(void) {
       Q36CChain *c2 = q36cc_setup(&m2, 1);
       ck(c2 && c2->ok && !c2->xdev, "COLI_CUDA_CHAIN_EXPERTS=0 keeps the residents on the tier's host path");
       setenv("COLI_CUDA_CHAIN_EXPERTS", "", 1);
+      ck(c2->graph, "and the graphs on");
+      q36cc_free_own(c2, &m2); m2.cchain = NULL; free(c2);
+      setenv("COLI_CUDA_CHAIN_GRAPH", "0", 1);
+      c2 = q36cc_setup(&m2, 1);
+      ck(c2 && c2->ok && !c2->graph, "COLI_CUDA_CHAIN_GRAPH=0 keeps the frames op by op");
+      setenv("COLI_CUDA_CHAIN_GRAPH", "", 1);
       (void)m2; }
 
     qt_shutdown();

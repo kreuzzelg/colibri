@@ -257,28 +257,61 @@ static int fcc_reserve(CcBuf **b, size_t bytes, int kind) {
 static void *fcc_ptr(const CcBuf *b) { return b ? b->d : NULL; }
 static size_t fcc_bytes(const CcBuf *b) { return b ? b->bytes : 0; }
 static int fcc_begin(void) { return fcc_ready(); }
+struct CcGraph; static struct CcGraph *fake_rec;   /* the capture in progress (the recorder, below) */
 static int fcc_submit(int wait) {
     (void)wait;
-    if (!fcc_ready()) return 0;
+    if (!fcc_ready() || fake_rec) return 0;
     fake_chain_frames++;
     if (fake_chain_fail_at && fake_chain_frames == fake_chain_fail_at) { fake_chain_lost = 1; return 0; }
     return 1;
 }
 static int fcc_finish(void) { return fcc_ready(); }
+/* A graph as the fake records it: the ops issued between graph_begin and graph_end, kept
+ * as calls and replayed by graph_launch (nothing runs during the capture, as on the
+ * device). The ops a CUDA capture refuses are refused here too (experts, write). */
+enum { FR_COPY = 1, FR_ZERO, FR_REGIONS, FR_MATMUL, FR_NORM, FR_ROPE, FR_ATTN, FR_DNCONV, FR_DNREC, FR_EW, FR_KVPUT };
+typedef struct { int op, KD, n; CcBuf *b[8]; size_t z[3]; ColiCudaTensor *t; CcRegion *rg;
+                 union { CcNorm norm; CcRope rope; CcAttn attn; CcDnConv dnc; CcDnRec dnr; CcEw ew; CcKvPut kv; } p; } FRec;
+struct CcGraph { FRec *r; int n, cap; };
+static int fake_graphs, fake_graph_launches;    /* graphs instantiated / launched */
+static FRec *frec(int op) {
+    CcGraph *g = fake_rec;
+    if (g->n == g->cap) { g->cap = g->cap ? 2 * g->cap : 32; g->r = (FRec *)realloc(g->r, (size_t)g->cap * sizeof(FRec)); }
+    FRec *r = &g->r[g->n++]; memset(r, 0, sizeof *r); r->op = op; return r;
+}
+static int fcc_graph_begin(void) { if (!fcc_ready() || fake_rec) return 0; fake_rec = (CcGraph *)calloc(1, sizeof(CcGraph)); return 1; }
+static CcGraph *fcc_graph_end(void) { CcGraph *g = fake_rec; fake_rec = NULL; if (g) fake_graphs++; return g; }
+static int fcc_replay(const FRec *r);
+static int fcc_graph_launch(CcGraph *g) {
+    if (!fcc_ready() || !g || fake_rec) return 0;
+    fake_graph_launches++;
+    for (int i = 0; i < g->n; i++) if (!fcc_replay(&g->r[i])) return 0;
+    return 1;
+}
+static void fcc_graph_free(CcGraph *g) { if (!g) return; for (int i = 0; i < g->n; i++) free(g->r[i].rg); free(g->r); free(g); }
 static int fcc_copy(CcBuf *dst, size_t doff, CcBuf *src, size_t soff, size_t n) {
     if (!fcc_ready() || !dst || !src || (doff + n) * 4 > dst->bytes || (soff + n) * 4 > src->bytes) return 0;
+    if (fake_rec) { FRec *r = frec(FR_COPY); r->b[0] = dst; r->b[1] = src; r->z[0] = doff; r->z[1] = soff; r->z[2] = n; return 1; }
     memmove(dst->d + doff, src->d + soff, n * 4); fake_chain_ops++; return 1;
 }
 static int fcc_zero(CcBuf *dst, size_t off, size_t n) {
     if (!fcc_ready() || !dst || (off + n) * 4 > dst->bytes) return 0;
+    if (fake_rec) { FRec *r = frec(FR_ZERO); r->b[0] = dst; r->z[0] = off; r->z[2] = n; return 1; }
     memset(dst->d + off, 0, n * 4); return 1;
 }
 static int fcc_copy_regions(CcBuf *dst, CcBuf *src, const CcRegion *r, int n) {
+    if (fake_rec) {
+        if (!fcc_ready() || !dst || !src) return 0;
+        for (int i = 0; i < n; i++) if ((r[i].dst + r[i].n) * 4 > dst->bytes || (r[i].src + r[i].n) * 4 > src->bytes) return 0;
+        FRec *q = frec(FR_REGIONS); q->b[0] = dst; q->b[1] = src; q->n = n;
+        q->rg = (CcRegion *)malloc(sizeof(CcRegion) * (size_t)(n > 0 ? n : 1)); memcpy(q->rg, r, sizeof(CcRegion) * (size_t)n);
+        return 1;
+    }
     for (int i = 0; i < n; i++) if (!fcc_copy(dst, r[i].dst, src, r[i].src, r[i].n)) return 0;
     return 1;
 }
 static int fcc_write(CcBuf *dst, size_t off, const void *src, size_t bytes) {
-    if (!fcc_ready() || !dst || off * 4 + bytes > dst->bytes) return 0;
+    if (!fcc_ready() || !dst || off * 4 + bytes > dst->bytes || fake_rec) return 0;
     memcpy((char *)dst->d + off * 4, src, bytes); return 1;
 }
 static int fcc_read(CcBuf *src, size_t off, void *dst, size_t bytes) {
@@ -288,6 +321,7 @@ static int fcc_read(CcBuf *src, size_t off, void *dst, size_t bytes) {
 static int fcc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t yo, int S) {
     if (!fcc_ready() || !t || !x || !y || S < 1 || !t->w) return 0;
     if ((xo + (size_t)S * t->I) * 4 > x->bytes || (yo + (size_t)S * t->O) * 4 > y->bytes) return 0;
+    if (fake_rec) { FRec *r = frec(FR_MATMUL); r->t = t; r->b[0] = x; r->b[1] = y; r->z[0] = xo; r->z[1] = yo; r->n = S; return 1; }
     fake_chain_ops++;
     for (int s = 0; s < S; s++) {
         const float *xs = x->d + xo + (size_t)s * t->I; float *ys = y->d + yo + (size_t)s * t->O;
@@ -305,6 +339,7 @@ static int fcc_matmul(ColiCudaTensor *t, CcBuf *x, size_t xo, CcBuf *y, size_t y
 }
 static int fcc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
     if (!fcc_ready() || !x || !y || !p) return 0;
+    if (fake_rec) { FRec *r = frec(FR_NORM); r->b[0] = x; r->b[1] = w; r->b[2] = y; r->p.norm = *p; return 1; }
     fake_chain_ops++;
     for (int g = 0; g < p->nseg; g++) {
         int row = g / p->per_row, j = g - row * p->per_row;
@@ -322,6 +357,7 @@ static int fcc_norm(CcBuf *x, CcBuf *w, CcBuf *y, const CcNorm *p) {
 }
 static int fcc_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
     if (!fcc_ready() || !x || !cs || !p) return 0;
+    if (fake_rec) { FRec *r = frec(FR_ROPE); r->b[0] = x; r->b[1] = cs; r->p.rope = *p; return 1; }
     fake_chain_ops++;
     for (int seg = 0; seg < p->nseg; seg++) {
         int row = seg / p->per_row, hh = seg - row * p->per_row;
@@ -335,14 +371,15 @@ static int fcc_rope(CcBuf *x, CcBuf *cs, const CcRope *p) {
     return 1;
 }
 static int fcc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf *sel, const CcAttn *p) {
-    if (!fcc_ready() || !q || !kc || !vc || !o || !p || (p->has_gate && !gate)) return 0;
+    if (!fcc_ready() || !q || !kc || !vc || !o || !p || (p->has_gate && !gate) || (p->pos_dyn && !sel)) return 0;
+    if (fake_rec) { FRec *r = frec(FR_ATTN); r->b[0] = q; r->b[1] = kc; r->b[2] = vc; r->b[3] = o; r->b[4] = gate; r->b[5] = sel; r->p.attn = *p; return 1; }
     fake_chain_ops++;
     int rep = p->H / p->KVH;
     for (int s = 0; s < p->S; s++) for (int h = 0; h < p->H; h++) {
         int kvh = h / rep, kbase = kvh * p->cap;
         const float *qs = q->d + p->q_off + s * p->q_row + h * p->q_seg;
-        int n = p->pos_base + s + 1, list = 0, lb = 0;
-        if (p->sel_row > 0 && sel) { lb = p->sel_off + s * p->sel_row; int c = ((const int *)sel->d)[lb]; if (c >= 0) { n = c; list = 1; } }
+        int n = (p->pos_dyn ? ((const int *)sel->d)[0] : p->pos_base) + s + 1, list = 0, lb = 0;
+        if (p->sel_row > 0 && sel && !p->pos_dyn) { lb = p->sel_off + s * p->sel_row; int c = ((const int *)sel->d)[lb]; if (c >= 0) { n = c; list = 1; } }
         float m = -3.0e38f, l = 0.f, acc[256]; for (int d = 0; d < p->hd; d++) acc[d] = 0.f;
         for (int t0 = 0; t0 < n; t0 += 128) {
             int cnt = n - t0 < 128 ? n - t0 : 128; float sv[128], pe[128]; int pt[128];
@@ -371,6 +408,7 @@ static int fcc_attn(CcBuf *q, CcBuf *kc, CcBuf *vc, CcBuf *o, CcBuf *gate, CcBuf
 }
 static int fcc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap, const CcDnConv *p) {
     if (!fcc_ready() || !in || !w || !ring || !out || !p || (p->snap_row >= 0 && !snap)) return 0;
+    if (fake_rec) { FRec *r = frec(FR_DNCONV); r->b[0] = in; r->b[1] = w; r->b[2] = ring; r->b[3] = out; r->b[4] = snap; r->p.dnc = *p; return 1; }
     fake_chain_ops++;
     if (p->snap_row >= 0) fake_dn_snapshots++;
     int nh = p->CK - 1;
@@ -394,6 +432,7 @@ static int fcc_dnconv(CcBuf *in, CcBuf *w, CcBuf *ring, CcBuf *out, CcBuf *snap,
 static float fcc_softplus(float x) { if (x > 20.f) return x; float e = expf(x); return e < 1e-4f ? e - 0.5f * e * e : logf(1.f + e); }
 static int fcc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *prm, CcBuf *y, CcBuf *snap, const CcDnRec *p) {
     if (!fcc_ready() || !cv || !ab || !z || !st || !prm || !y || !p || (p->snap_row >= 0 && !snap) || KD > 256 || p->VD > 128) return 0;
+    if (fake_rec) { FRec *r = frec(FR_DNREC); r->KD = KD; r->b[0] = cv; r->b[1] = ab; r->b[2] = z; r->b[3] = st; r->b[4] = prm; r->b[5] = y; r->b[6] = snap; r->p.dnr = *p; return 1; }
     fake_chain_ops++;
     if (p->snap_row >= 0) fake_dn_snapshots++;
     for (int h = 0; h < p->VH; h++) {
@@ -432,6 +471,7 @@ static int fcc_dnrec(int KD, CcBuf *cv, CcBuf *ab, CcBuf *z, CcBuf *st, CcBuf *p
 static float fcc_sig(float x) { return 1.f / (1.f + expf(-x)); }
 static int fcc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const CcEw *p) {
     if (!fcc_ready() || !y || !p) return 0;
+    if (fake_rec) { FRec *r = frec(FR_EW); r->b[0] = y; r->b[1] = a; r->b[2] = b; r->b[3] = c; r->b[4] = e; r->p.ew = *p; return 1; }
     fake_chain_ops++;
     float *Y = y->d; const float *A = a ? a->d : NULL, *B = b ? b->d : NULL, *Cc = c ? c->d : NULL, *E = e ? e->d : NULL;
     for (int i = 0; i < p->n; i++) {
@@ -546,7 +586,7 @@ static int fcc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated
 static int fake_chain_experts;   /* residents computed through it */
 static int fcc_experts(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d, const float *vals, int count,
                        CcBuf *x, size_t xo, CcBuf *y, size_t yo) {
-    if (!fcc_ready() || !g || !u || !d || !vals || count < 1 || !x || !y || !g[0]) return 0;
+    if (!fcc_ready() || fake_rec || !g || !u || !d || !vals || count < 1 || !x || !y || !g[0]) return 0;
     int D = g[0]->I, I = g[0]->O;
     if ((xo + (size_t)D) * 4 > x->bytes || (yo + (size_t)D) * 4 > y->bytes) return 0;
     for (int c = 0; c < count; c++) {
@@ -575,6 +615,34 @@ static int fcc_experts(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiC
     free(h);
     return 1;
 }
+static int fcc_kvput(CcBuf *kc, CcBuf *vc, CcBuf *k, CcBuf *v, CcBuf *pos, const CcKvPut *p) {
+    if (!fcc_ready() || !kc || !vc || !k || !v || !p || p->S < 1) return 0;
+    if (fake_rec) { FRec *r = frec(FR_KVPUT); r->b[0] = kc; r->b[1] = vc; r->b[2] = k; r->b[3] = v; r->b[4] = pos; r->p.kv = *p; return 1; }
+    fake_chain_ops++;
+    int pb = pos ? ((const int *)pos->d)[0] : p->pos_base;
+    for (int s = 0; s < p->S; s++) for (int h = 0; h < p->KVH; h++) {
+        size_t dst = ((size_t)h * p->cap + pb + s) * p->hd, src = (size_t)s * p->src_row + (size_t)h * p->hd;
+        if ((p->k_off + dst + p->hd) * 4 > kc->bytes || (p->v_off + dst + p->hd) * 4 > vc->bytes || (src + p->hd) * 4 > k->bytes) return 0;
+        memcpy(kc->d + p->k_off + dst, k->d + src, (size_t)p->hd * 4); memcpy(vc->d + p->v_off + dst, v->d + src, (size_t)p->hd * 4);
+    }
+    return 1;
+}
+static int fcc_replay(const FRec *r) {
+    switch (r->op) {
+    case FR_COPY:    return fcc_copy(r->b[0], r->z[0], r->b[1], r->z[1], r->z[2]);
+    case FR_ZERO:    return fcc_zero(r->b[0], r->z[0], r->z[2]);
+    case FR_REGIONS: return fcc_copy_regions(r->b[0], r->b[1], r->rg, r->n);
+    case FR_MATMUL:  return fcc_matmul(r->t, r->b[0], r->z[0], r->b[1], r->z[1], r->n);
+    case FR_NORM:    return fcc_norm(r->b[0], r->b[1], r->b[2], &r->p.norm);
+    case FR_ROPE:    return fcc_rope(r->b[0], r->b[1], &r->p.rope);
+    case FR_ATTN:    return fcc_attn(r->b[0], r->b[1], r->b[2], r->b[3], r->b[4], r->b[5], &r->p.attn);
+    case FR_DNCONV:  return fcc_dnconv(r->b[0], r->b[1], r->b[2], r->b[3], r->b[4], &r->p.dnc);
+    case FR_DNREC:   return fcc_dnrec(r->KD, r->b[0], r->b[1], r->b[2], r->b[3], r->b[4], r->b[5], r->b[6], &r->p.dnr);
+    case FR_EW:      return fcc_ew(r->b[0], r->b[1], r->b[2], r->b[3], r->b[4], &r->p.ew);
+    case FR_KVPUT:   return fcc_kvput(r->b[0], r->b[1], r->b[2], r->b[3], r->b[4], &r->p.kv);
+    }
+    return 0;
+}
 static void fcc_stats(CcStats *st) { memset(st, 0, sizeof *st); st->frames = (unsigned long long)fake_chain_frames; st->ops = (unsigned long long)fake_chain_ops; st->dev_bytes = fake_chain_dev_bytes; st->experts = (unsigned long long)fake_chain_experts; }
 static const ColiCudaChainOps fake_chain_table = {
     sizeof(ColiCudaChainOps), fcc_init, fcc_ready, fcc_lost, fcc_shutdown, fcc_device, fcc_device_now,
@@ -583,6 +651,7 @@ static const ColiCudaChainOps fake_chain_table = {
     fcc_matmul, fcc_norm, fcc_rope, fcc_attn, fcc_dnconv, fcc_dnrec, fcc_ew, fcc_stats,
     fcc_qsa, fcc_ple,
     fcc_experts,
+    fcc_kvput, fcc_graph_begin, fcc_graph_end, fcc_graph_launch, fcc_graph_free,
 };
 static int fake_chain_absent;   /* 1: a backend without the chain (an older DLL) */
 const ColiCudaChainOps *coli_cuda_chain_ops(void) { return fake_chain_absent ? NULL : &fake_chain_table; }

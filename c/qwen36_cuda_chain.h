@@ -73,6 +73,10 @@ typedef struct {
     CcBuf *rdev;                               /* the residents' weighted sum per row, computed on the device (the route) */
     int xdev, last_xdev;                       /* the route is on; the layer just computed used it */
     unsigned long long xdev_rows, xdev_experts, xdev_refused;
+    CcGraph **g1;                              /* a decode token's frame A1 per layer, captured once, launched since (COLI_CUDA_CHAIN_GRAPH) */
+    CcBuf *posb;                               /* the position the captured frames read (pos_base of the row) */
+    int graph, buf_rows;                       /* graphs wanted and possible; the rows the scratch was last sized for */
+    unsigned long long graph_captures, graph_launches;
     unsigned long long forwards, frames, fault_at, dec_n;   /* dec_n: one-row forwards (decode tokens) */
     double wait_ms, host_ms, dec_wait_ms, dec_host_ms;      /* and their shares of the waits and the host's experts */
 } Q36CChain;
@@ -83,6 +87,8 @@ static Q36CChain *q36cc_of(Model *m) { return (Q36CChain *)m->cchain; }
 static int q36cc_env_on(void) { const char *e = getenv("COLI_CUDA_CHAIN"); return e && *e == '1'; }
 /* COLI_CUDA_CHAIN_EXPERTS=0: the residents through the tier's host path (qt_issue / qt_take) instead of the route */
 static int q36cc_experts_env(void) { const char *e = getenv("COLI_CUDA_CHAIN_EXPERTS"); return !e || *e != '0'; }
+/* COLI_CUDA_CHAIN_GRAPH=0: every decode frame issued op by op (no graphs captured) */
+static int q36cc_graph_env(void) { const char *e = getenv("COLI_CUDA_CHAIN_GRAPH"); return !e || *e != '0'; }
 static int q36cc_rows_env(void) {
     const char *e = getenv("COLI_CUDA_CHAIN_ROWS");
     int r = e && *e ? atoi(e) : 256;
@@ -95,11 +101,12 @@ static void q36cc_fatal(const char *what) {
 /* The device was lost with the newest recurrent state on it. The host's KV rows are
  * canonical, the DeltaNet state is not: rebuild it on the CPU by running the `upto`
  * positions the prefix record names (a prefill on the CPU), and leave the chain off. */
+static void q36cc_graphs_drop(Q36CChain *ch, Model *m);
 static void q36cc_recover(Model *m, int upto) {
     Q36CChain *ch = q36cc_of(m);
     Cfg *c = &m->c; int D = c->hidden;
     g_cuda_chain = 0;
-    if (ch) { ch->failed = 1; ch->dn_where = Q36CC_HOST; ch->host_zero = 0; ch->snap_valid = 0; }
+    if (ch) { ch->failed = 1; ch->dn_where = Q36CC_HOST; ch->host_zero = 0; ch->snap_valid = 0; q36cc_graphs_drop(ch, m); }
     for (int i = 0; i < c->n_layers; i++) {
         if (c->is_attn[i]) continue;
         memset(m->DN_rec[i], 0, (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim * sizeof(float));
@@ -165,8 +172,15 @@ static int q36cc_take(Q36CChain *ch, ColiCudaTensor **slot, ColiCudaTensor *t, i
     return 1;
 }
 
+/* the captured frames go: a buffer they name moved, or the route changed what a frame holds */
+static void q36cc_graphs_drop(Q36CChain *ch, Model *m) {
+    if (!ch->g1) return;
+    for (int i = 0; i < m->c.n_layers; i++) { cc_graph_free(ch->g1[i]); ch->g1[i] = NULL; }
+}
 static void q36cc_free_own(Q36CChain *ch, Model *m) {
     int L = m->c.n_layers;
+    q36cc_graphs_drop(ch, m);
+    cc_free(ch->posb); ch->posb = NULL;
     if (ch->t_ab) for (int i = 0; i < L; i++) { if (ch->t_ab[i]) coli_cuda_tensor_free(ch->t_ab[i]); ch->t_ab[i] = NULL; }
     if (ch->t_sg) for (int i = 0; i < L; i++) { if (ch->t_sg[i]) coli_cuda_tensor_free(ch->t_sg[i]); ch->t_sg[i] = NULL; }
     if (ch->t_gate) for (int i = 0; i < L; i++) { if (ch->t_gate[i]) coli_cuda_tensor_free(ch->t_gate[i]); ch->t_gate[i] = NULL; }
@@ -298,11 +312,15 @@ static Q36CChain *q36cc_setup(Model *m, int mux_slots) {
     { const char *e = getenv("COLI_CUDA_CHAIN_FAULT"); ch->fault_at = e && *e ? strtoull(e, NULL, 10) : 0; }
     ch->ok = 1;
     ch->xdev = c->n_experts > 0 && q36cc_experts_env() && qt_resident_capable(ch->dev);
+    ch->g1 = calloc((size_t)L, sizeof(CcGraph *));
+    ch->posb = cc_buf(4 * sizeof(int), CC_UP);
+    ch->graph = ch->g1 && ch->posb && c->n_experts > 0 && q36cc_graph_env();
     fprintf(stderr, "[chain] qwen36: %d layers on CUDA device %d (%d attention), lm_head too; %.1f MiB of parameters, "
                     "%.1f MiB of router, b|a and gate rows, %.0f MB of DeltaNet state; the resident experts %s\n",
             L, ch->dev, ch->n_attn, np * 4 / 1048576.0, own / 1048576.0,
             (double)(L - ch->n_attn) * ((double)vh * c->dn_kdim * c->dn_vdim + (double)conv_dim * (convk - 1)) * 4 / 1e6,
             ch->xdev ? "on the chain's stream" : c->n_experts > 0 && q36cc_experts_env() && qt_experts_on() ? "through the tier's host path (more than one device)" : "through the tier's host path");
+    if (ch->graph) fprintf(stderr, "[chain] qwen36: a decode token's frames as graphs, captured at the first token (COLI_CUDA_CHAIN_GRAPH=0 turns it off)\n");
     return ch;
 }
 
@@ -330,6 +348,7 @@ static int q36cc_bufs(Q36CChain *ch, Model *m, int rows) {
 static int q36cc_mirror(Q36CChain *ch, Model *m) {
     Cfg *c = &m->c; int KV = c->kv_heads;
     if (ch->cap != m->kv_cap) {
+        q36cc_graphs_drop(ch, m);
         for (int i = 0; i < c->n_layers; i++) {
             if (!c->is_attn[i]) continue;
             cc_free(ch->kc[i]); cc_free(ch->vc[i]); ch->kc[i] = ch->vc[i] = NULL;
@@ -344,6 +363,7 @@ static int q36cc_mirror(Q36CChain *ch, Model *m) {
 }
 static int q36cc_scratch(Q36CChain *ch, Model *m, int rows) {
     Cfg *c = &m->c; int D = c->hidden;
+    if (rows > ch->buf_rows) { q36cc_graphs_drop(ch, m); ch->buf_rows = rows; }   /* a scratch buffer may move */
     if (!q36cc_bufs(ch, m, rows)) return 0;
     if (ch->rows < rows) {
         float *hr = realloc(ch->host_routed, (size_t)rows * D * sizeof(float));
@@ -392,10 +412,13 @@ static void q36cc_rollback(Model *m, int slot, int len) {
     if (!ch || !ch->ok) return;
     for (int i = 0; i < m->c.n_layers; i++) if (ch->kv_valid[i] > len) ch->kv_valid[i] = len;
     if (slot < 0 || slot >= ch->snap_valid || ch->dn_where != Q36CC_DEV) { ch->snap_valid = 0; return; }
-    for (int i = 0; i < m->c.n_layers; i++) {
-        if (m->c.is_attn[i]) continue;
-        CcBuf *t = ch->rec[i]; ch->rec[i] = ch->rec_snap[slot][i]; ch->rec_snap[slot][i] = t;
-        t = ch->ring[i]; ch->ring[i] = ch->ring_snap[slot][i]; ch->ring_snap[slot][i] = t;
+    /* copied, not swapped: the captured frames name the state buffers (0.2 ms of device copies) */
+    Cfg *c = &m->c;
+    size_t nr = (size_t)c->dn_vheads * c->dn_kdim * c->dn_vdim, nc = (size_t)c->dn_conv_dim * (c->dn_convk - 1);
+    for (int i = 0; i < c->n_layers; i++) {
+        if (c->is_attn[i]) continue;
+        if (!cc_copy(ch->rec[i], 0, ch->rec_snap[slot][i], 0, nr) || !cc_copy(ch->ring[i], 0, ch->ring_snap[slot][i], 0, nc))
+            q36cc_fatal("the rollback's copies failed");
     }
     ch->snap_valid = 0;
 }
@@ -447,7 +470,7 @@ static int q36cc_norm(CcBuf *x, size_t xo, CcBuf *w, size_t wo, CcBuf *y, size_t
     CcNorm p = {rows, D, 1, (int)xo, D, D, (int)yo, D, D, (int)wo, 0, CC_NORM_ADD1, eps, 1.f};
     return cc_norm(x, w, y, &p);
 }
-static int q36cc_attention(Q36CChain *ch, Model *m, Layer *l, int i, int n, int pb) {
+static int q36cc_attention(Q36CChain *ch, Model *m, Layer *l, int i, int n, int pb, int dyn) {
     Cfg *c = &m->c;
     int H = c->q_heads, KV = c->kv_heads, hd = c->head_dim, qdim = c->q_head_dim, kvd = c->k_head_dim;
     int qo = H * qdim, kvo = KV * kvd, half = c->rotary_dim / 2, gate_dim = qdim > hd ? qdim - hd : 0;
@@ -461,18 +484,15 @@ static int q36cc_attention(Q36CChain *ch, Model *m, Layer *l, int i, int n, int 
                        ok = cc_norm(ch->k, ch->prm, ch->k, &p); }
     if (ok && half) { CcRope p = {n * KV, KV, 0, kvo, kvd, half, 0, 2 * half}; ok = cc_rope(ch->k, ch->cs, &p); }
     if (!ok) return 0;
-    /* the new rows into the device cache, and to the host's */
+    /* the new rows into the device cache, and to the host's; a captured frame (dyn) takes the
+     * position from the position buffer, so the same frame serves every later token */
     size_t ko = (size_t)ch->attn_ord[i] * 2 * ch->rows * kvo;
-    CcRegion *rg = malloc(sizeof *rg * (size_t)n * KV);
-    if (!rg) return 0;
-    for (int s = 0; s < n; s++) for (int h = 0; h < KV; h++)
-        rg[s * KV + h] = (CcRegion){((size_t)h * ch->cap + pb + s) * kvd, (size_t)s * kvo + (size_t)h * kvd, (size_t)kvd};
-    ok = cc_copy_regions(ch->kc[i], ch->k, rg, n * KV) && cc_copy_regions(ch->vc[i], ch->v, rg, n * KV) &&
+    CcKvPut kp = {n, KV, kvd, ch->cap, kvo, pb, 0, 0};
+    ok = cc_kvput(ch->kc[i], ch->vc[i], ch->k, ch->v, dyn ? ch->posb : NULL, &kp) &&
          cc_copy(ch->kvd, ko, ch->k, 0, (size_t)n * kvo) && cc_copy(ch->kvd, ko + (size_t)ch->rows * kvo, ch->v, 0, (size_t)n * kvo);
-    free(rg);
     CcAttn a = {n, H, KV, hd, pb, ch->cap, 0, qo, qdim, hd, qo, qdim, gate_dim > 0, 0, H * hd, 0, 0,
-                1.f / sqrtf((float)hd), 0, 0};
-    return ok && cc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, NULL, &a) &&
+                1.f / sqrtf((float)hd), 0, 0, dyn};
+    return ok && cc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, dyn ? ch->posb : NULL, &a) &&
            cc_matmul(ch->t_o[i], ch->ctx, 0, ch->tmp, 0, n);
 }
 /* ns: the chunk's rows a verify copies the state after (rows 0..ns-1, slots c0..): the
@@ -549,6 +569,7 @@ static uint32_t q36cc_experts_row(Model *m, int layer, int s, const int *idx, co
         }
         if (!cc_lost()) {
             ch->xdev = 0; ch->xdev_refused++;
+            q36cc_graphs_drop(ch, m);   /* the captured combines add the device's sum */
             fprintf(stderr, "[chain] qwen36: the device declined the routed experts of layer %d (%d resident, a format or shape the "
                             "kernels do not take); they stay on the host from here (the tier's path)\n", layer, n);
         }
@@ -562,6 +583,28 @@ static int q36cc_frame_begin(Q36CChain *ch) {
     ch->frames++;
     if (ch->fault_at && ch->frames == ch->fault_at) { fprintf(stderr, "[chain] qwen36: fault injected at frame %llu\n", ch->frames); return 0; }
     return cc_begin();
+}
+
+/* Frame A1 of layer i: the layer before's MoE output into the residual, the input norm, the
+ * attention or the DeltaNet step, the residual add, the post norm, the router logits and
+ * the two rows down (h2d, lgd). dyn: the ops read the position from posb (a captured frame). */
+static int q36cc_a1(Q36CChain *ch, Model *m, Layer *l, int i, int n, int pb, int c0, int ns, FILE *lf, int pending, int dyn) {
+    Cfg *c = &m->c; int D = c->hidden, E = c->n_experts, ok = 1;
+    if (pending) {
+        ok = q36cc_combine(ch, m, i - 1, n);
+        if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(i - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
+    }
+    ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
+    ok = ok && (c->is_attn[i] ? q36cc_attention(ch, m, l, i, n, pb, dyn) : q36cc_deltanet(ch, m, l, i, n, c0, ns));
+    if (ok && lf) ok = cc_copy(ch->lfd, (size_t)i * 3 * D, ch->tmp, (size_t)(n - 1) * D, D);
+    CcEw add = {CC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+    ok = ok && cc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
+    if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)i * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
+    ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
+    if (ok && E > 0)
+        ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) &&
+             cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
+    return ok;
 }
 
 /* Every layer for S rows from host rows xh, the last nlogits rows' logits into `logit`;
@@ -611,23 +654,29 @@ static int q36cc_forward(Model *m, float *xh, int S, int pos_base, FILE *lf, int
         }
         if (!q36cc_frame_begin(ch) || !cc_write(ch->x, 0, xh + (size_t)c0 * D, (size_t)n * D * sizeof(float)) ||
             !q36cc_push_state(ch, m, pb)) goto lost;
+        /* a decode token's A1 frames as graphs: captured at the first such token (the position
+         * read from posb), launched since -- one call instead of fifteen per layer */
+        int gr = ch->graph && S == 1 && n == 1 && !lf && !ns && E > 0;
+        if (ch->posb) ((int *)cc_ptr(ch->posb))[0] = pb;
         int ok = 1, pending = 0;
         for (int i = 0; i < L && ok; i++) {
             Layer *l = &m->L[i];
-            if (pending) {
-                ok = q36cc_combine(ch, m, i - 1, n);
-                if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)(i - 1) * 3 + 2) * D, ch->x, (size_t)(n - 1) * D, D);
-            }
-            ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_in[i], ch->nrm, 0, n, D, c->eps);
-            ok = ok && (c->is_attn[i] ? q36cc_attention(ch, m, l, i, n, pb) : q36cc_deltanet(ch, m, l, i, n, c0, ns));
-            if (ok && lf) ok = cc_copy(ch->lfd, (size_t)i * 3 * D, ch->tmp, (size_t)(n - 1) * D, D);
-            CcEw add = {CC_EW_ADD, n * D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
-            ok = ok && cc_ew(ch->x, ch->x, ch->tmp, NULL, NULL, &add);
-            if (ok && lf) ok = cc_copy(ch->lfd, ((size_t)i * 3 + 1) * D, ch->x, (size_t)(n - 1) * D, D);
-            ok = ok && q36cc_norm(ch->x, 0, ch->prm, ch->o_post[i], ch->h2, 0, n, D, c->eps);
+            if (gr && ch->g1[i]) { ok = cc_graph_launch(ch->g1[i]); ch->graph_launches++; }
+            else if (gr && cc_graph_begin()) {
+                ok = q36cc_a1(ch, m, l, i, n, pb, c0, ns, lf, pending, 1);
+                CcGraph *g = cc_graph_end();
+                if (ok && g) { ch->g1[i] = g; ch->graph_captures++; ok = cc_graph_launch(g); ch->graph_launches++; }
+                else {
+                    cc_graph_free(g);
+                    if (cc_lost()) ok = 0;
+                    else {   /* the capture failed (an op it could not take): this and every later frame op by op */
+                        if (ch->graph) fprintf(stderr, "[chain] qwen36: the capture of layer %d's frame failed; the frames are issued op by op\n", i);
+                        ch->graph = 0;
+                        ok = q36cc_a1(ch, m, l, i, n, pb, c0, ns, lf, pending, 0);
+                    }
+                }
+            } else ok = q36cc_a1(ch, m, l, i, n, pb, c0, ns, lf, pending, 0);
             if (ok && E > 0) {
-                ok = cc_matmul(ch->t_gate[i], ch->h2, 0, ch->lg, 0, n) &&
-                     cc_copy(ch->lgd, 0, ch->lg, 0, (size_t)n * E) && cc_copy(ch->h2d, 0, ch->h2, 0, (size_t)n * D);
                 double t0 = tm_now();
                 ok = ok && cc_submit(1);   /* A1 */
                 ch->wait_ms += tm_now() - t0;
@@ -709,6 +758,8 @@ static void q36cc_report(Model *m) {
                     "%.1f ms of routed experts on the host, %.1f MiB on the device; per decode token %.2f ms waiting, %.2f ms of experts (%llu tokens)\n",
             ch->forwards, st.frames, st.ops, st.matmuls, ch->wait_ms, ch->host_ms, st.dev_bytes / 1048576.0,
             ch->dec_n ? ch->dec_wait_ms / ch->dec_n : 0.0, ch->dec_n ? ch->dec_host_ms / ch->dec_n : 0.0, ch->dec_n);
+    if (ch->graph_captures)
+        fprintf(stderr, "[chain] qwen36: %llu frames captured as graphs, %llu graph launches\n", ch->graph_captures, ch->graph_launches);
     if (ch->xdev_rows || ch->xdev_refused)
         fprintf(stderr, "[chain] qwen36: the route: %llu resident experts over %llu rows on the chain's stream%s\n",
                 ch->xdev_experts, ch->xdev_rows, ch->xdev_refused ? ", then declined by the device (the tier's path from there)" : "");

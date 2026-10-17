@@ -596,7 +596,7 @@ static int q38cc_attention(Q38CChain *ch, Model *m, Layer *l, int i, int n, int 
     int nbmax = (int)(cc_bytes(ch->qsc) / 4 / (2 * (size_t)ch->rows));
     CcQsa ps = {1, ID, R, 0, 0, n, pb, c->idx_budget, IQ, 0, ipw, nbmax, q38cc_selrow(c), c->eps, 0, 0, 0, 0};
     CcAttn at = {n, QH, KVH, D, pb, ch->cap, 0, qo, 2 * D, D, qo, 2 * D, 1, 0, QH * D, 0, q38cc_selrow(c),
-                 1.f / sqrtf((float)D), 0, 0};
+                 1.f / sqrtf((float)D), 0, 0, 0};
     return ok && cc_qsa(ch->ip, NULL, ch->pk[i], NULL, ch->qsc, ch->sel, &ps) &&
            cc_attn(ch->q, ch->kc[i], ch->vc[i], ch->ctx, ch->q, ch->sel, &at) &&
            cc_matmul(q38cc_t(ch, &l->o), ch->ctx, 0, ch->blk, 0, n);

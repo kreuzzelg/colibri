@@ -35,10 +35,11 @@ extern "C" int coli_cuda_experts_dev_async(ColiCudaTensor *const *gates, ColiCud
                                             const float *x_dev, float *y_dev, void *stream);
 
 struct CcBuf { int kind, dev; size_t bytes; float *d; void *h; };
+struct CcGraph { int device; cudaGraph_t graph; cudaGraphExec_t exec; };
 
 namespace {
 struct CcCtx {
-    int device, up, lost, in_frame;
+    int device, up, lost, in_frame, capturing;
     cudaStream_t stream;
     cudaEvent_t ev; int ev_ok, ev_pending;
 };
@@ -73,6 +74,17 @@ float *fpw(CcBuf *b) { return b ? b->d : nullptr; }
 }
 
 /* ---- kernels: shaders/chain_*.comp, line for line --------------------------- */
+/* the K/V rows of S positions into the caches (one block per (row, kv head)) */
+__global__ static void cc_kvput_k(float *__restrict__ kc, float *__restrict__ vc, const float *__restrict__ k,
+                                  const float *__restrict__ v, const int *__restrict__ pos, CcKvPut p) {
+    int s = blockIdx.x / p.KVH, h = blockIdx.x - s * p.KVH;
+    int pb = pos ? pos[0] : p.pos_base;
+    size_t dst = ((size_t)h * p.cap + pb + s) * p.hd, src = (size_t)s * p.src_row + (size_t)h * p.hd;
+    for (int d = threadIdx.x; d < p.hd; d += blockDim.x) {
+        kc[p.k_off + dst + d] = k[src + d];
+        vc[p.v_off + dst + d] = v[src + d];
+    }
+}
 __global__ static void cc_norm_k(const float *__restrict__ x, const float *__restrict__ w, float *__restrict__ y, CcNorm p) {
     __shared__ float red[256];
     int g = blockIdx.x;
@@ -120,10 +132,10 @@ __global__ static void __launch_bounds__(128) cc_attn_k(const float *__restrict_
     int kvh = h / (p.H / p.KVH);
     int qb = p.q_off + s * p.q_row + h * p.q_seg;
     for (int d = tid; d < p.hd; d += 128) qs[d] = q[qb + d];
-    int n = p.pos_base + s + 1;
+    int n = (p.pos_dyn ? sel[0] : p.pos_base) + s + 1;
     bool list = false;
     int lb = 0;
-    if (p.sel_row > 0) {
+    if (p.sel_row > 0 && !p.pos_dyn) {
         lb = p.sel_off + s * p.sel_row;
         int c = sel[lb];
         if (c >= 0) { n = c; list = true; }
@@ -586,7 +598,7 @@ static int cc_begin(void) {
 }
 static int cc_submit(int wait) {
     CcCtx *c = live();
-    if (!c) return 0;
+    if (!c || c->capturing) return 0;   /* a frame under capture ends with graph_end, not here */
     c->in_frame = 0;
     if (!cc_ok(c, cudaEventRecord(c->ev, c->stream), "frame event")) return 0;
     c->ev_pending = 1;
@@ -763,7 +775,7 @@ static int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated,
 static int cc_experts(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d, const float *vals, int count,
                       CcBuf *x, size_t xo, CcBuf *y, size_t yo) {
     CcCtx *c = live();
-    if (!c || !g || !u || !d || !vals || count < 1 || !x || !y || !g[0]) return 0;
+    if (!c || c->capturing || !g || !u || !d || !vals || count < 1 || !x || !y || !g[0]) return 0;
     int fmt, D, I;
     if (!coli_cuda_tensor_shape(g[0], &fmt, &D, &I) || coli_cuda_tensor_device(g[0]) != c->device) return 0;
     if ((xo + (size_t)D) * 4 > x->bytes || (yo + (size_t)D) * 4 > y->bytes) return 0;
@@ -771,6 +783,55 @@ static int cc_experts(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCu
     if (rc < 0) { c->lost = 1; return 0; }
     if (rc > 0) { g_st.ops++; g_st.experts += (unsigned long long)count; }
     return rc > 0;
+}
+static int cc_kvput(CcBuf *kc, CcBuf *vc, CcBuf *k, CcBuf *v, CcBuf *pos, const CcKvPut *p) {
+    CcCtx *c = live();
+    if (!c || !kc || !vc || !k || !v || !p || p->S < 1 || p->KVH < 1 || p->hd < 1) return 0;
+    if (pos && pos->bytes < 4) return 0;
+    if ((size_t)(p->S - 1) * p->src_row + (size_t)p->KVH * p->hd > k->bytes / 4 || (size_t)(p->S - 1) * p->src_row + (size_t)p->KVH * p->hd > v->bytes / 4) return 0;
+    if (!pos && (size_t)p->k_off + ((size_t)(p->KVH - 1) * p->cap + p->pos_base + p->S) * p->hd > kc->bytes / 4) return 0;
+    cc_kvput_k<<<(unsigned)(p->S * p->KVH), 128, 0, c->stream>>>(fpw(kc), fpw(vc), fp(k), fp(v), pos ? (const int *)pos->d : nullptr, *p);
+    return launched(c, "kvput");
+}
+/* ---- graphs -------------------------------------------------------------------- */
+static int cc_graph_begin(void) {
+    CcCtx *c = live();
+    if (!c || c->capturing) return 0;
+    if (!cc_ok(c, cudaStreamBeginCapture(c->stream, cudaStreamCaptureModeThreadLocal), "graph capture")) return 0;
+    c->capturing = 1;
+    return 1;
+}
+static CcGraph *cc_graph_end(void) {
+    CcCtx *c = live();
+    if (!c || !c->capturing) return nullptr;
+    c->capturing = 0;
+    cudaGraph_t g = nullptr;
+    cudaError_t e = cudaStreamEndCapture(c->stream, &g);
+    if (e != cudaSuccess || !g) {   /* an op the capture could not take: the capture is void, the device is not lost */
+        (void)cudaGetLastError();
+        if (g) cudaGraphDestroy(g);
+        return nullptr;
+    }
+    CcGraph *r = (CcGraph *)calloc(1, sizeof *r);
+    if (!r) { cudaGraphDestroy(g); return nullptr; }
+    r->device = c->device; r->graph = g;
+    if (cudaGraphInstantiate(&r->exec, g, 0) != cudaSuccess) { (void)cudaGetLastError(); cudaGraphDestroy(g); free(r); return nullptr; }
+    return r;
+}
+static int cc_graph_launch(CcGraph *g) {
+    CcCtx *c = live();
+    if (!c || !g || g->device != c->device || c->capturing) return 0;
+    g_st.ops++;
+    return cc_ok(c, cudaGraphLaunch(g->exec, c->stream), "graph launch");
+}
+static void cc_graph_free(CcGraph *g) {
+    if (!g) return;
+    if (cudaSetDevice(g->device) == cudaSuccess) {
+        if (g->exec) cudaGraphExecDestroy(g->exec);
+        if (g->graph) cudaGraphDestroy(g->graph);
+    }
+    (void)cudaGetLastError();
+    free(g);
 }
 static void cc_stats(CcStats *st) { if (st) *st = g_st; }
 
@@ -784,5 +845,6 @@ static const ColiCudaChainOps g_cc_ops = {
     cc_stats,
     cc_qsa, cc_ple,
     cc_experts,
+    cc_kvput, cc_graph_begin, cc_graph_end, cc_graph_launch, cc_graph_free,
 };
 extern "C" const ColiCudaChainOps *coli_cuda_chain_ops(void) { return &g_cc_ops; }

@@ -65,7 +65,13 @@ typedef struct { int nseg, per_row, x_off, x_row, x_seg, half_, cs_off, cs_row; 
 /* chain_attn.comp (k_off/v_off: where the layer's cache starts in kc/vc; the cache
  * head-major, K[(kvh*cap + t)*hd + d]; sel_row > 0: a selection list per row) */
 typedef struct { int S, H, KVH, hd, pos_base, cap, q_off, q_row, q_seg, g_off, g_row, g_seg, has_gate,
-                 o_off, o_row, sel_off, sel_row; float scale; int k_off, v_off; } CcAttn;
+                 o_off, o_row, sel_off, sel_row; float scale; int k_off, v_off;
+                 int pos_dyn; } CcAttn;   /* pos_dyn: pos_base is read from sel[0] at run time (a graph's launches) */
+/* the new K/V rows of S positions into the head-major caches at pos_base (or at pos[0], a
+ * position buffer, when given): kc[k_off + (kvh*cap + pos+s)*hd + d] = k[s*src_row + kvh*hd + d] */
+typedef struct { int S, KVH, hd, cap, src_row, pos_base, k_off, v_off; } CcKvPut;
+/* a captured frame (graph_begin .. graph_end), launched as one unit */
+typedef struct CcGraph CcGraph;
 /* chain_dnconv.comp */
 typedef struct { int S, CD, CK, in_off, in_row, out_off, out_row, snap_row, order, w_off, ring_off, snap_off; } CcDnConv;
 /* chain_dnrec.comp (KD a template parameter: 4, 8, 16, 32, 64, 128 or 256; VD <= 128) */
@@ -143,6 +149,17 @@ typedef struct ColiCudaChainOps {
      * on the host). The caller holds the tensors until the frame they belong to has been waited for. */
     int  (*experts)(ColiCudaTensor *const *gates, ColiCudaTensor *const *ups, ColiCudaTensor *const *downs,
                     const float *vals, int count, CcBuf *x, size_t xo, CcBuf *y, size_t yo);
+    int  (*kvput)(CcBuf *kc, CcBuf *vc, CcBuf *k, CcBuf *v, CcBuf *pos, const CcKvPut *p);
+    /* A frame as a graph: begin captures the ops issued until end (nothing runs meanwhile);
+     * end hands back the graph, or NULL when the capture failed (the device is not lost
+     * unless `lost` says so: the caller issues the ops directly then); launch enqueues it on
+     * the chain's stream like the ops it holds. Ops whose parameters change between
+     * launches read them from buffers (CcAttn.pos_dyn, kvput's pos). Not every op can be
+     * captured: experts (its scratch may grow), write from pageable memory. */
+    int  (*graph_begin)(void);
+    CcGraph *(*graph_end)(void);
+    int  (*graph_launch)(CcGraph *g);
+    void (*graph_free)(CcGraph *g);
 } ColiCudaChainOps;
 
 /* The backend's table; NULL from a backend without the chain. Optional in the DLL
@@ -186,6 +203,11 @@ static inline int cc_ew(CcBuf *y, CcBuf *a, CcBuf *b, CcBuf *c, CcBuf *e, const 
 static inline void cc_stats(CcStats *st) { const ColiCudaChainOps *t = cc_ops(); if (t) t->stats(st); else memset(st, 0, sizeof *st); }
 static inline int cc_qsa(CcBuf *src, CcBuf *w, CcBuf *pk, CcBuf *cs, CcBuf *sc, CcBuf *sel, const CcQsa *p) { const ColiCudaChainOps *t = cc_ops(); return t ? t->qsa(src, w, pk, cs, sc, sel, p) : 0; }
 static inline int cc_ple(CcBuf *keys, CcBuf *hyp, CcBuf *val, CcBuf *prm, CcBuf *gated, CcBuf *normv, CcBuf *conv, CcBuf *ring, const CcPle *p) { const ColiCudaChainOps *t = cc_ops(); return t ? t->ple(keys, hyp, val, prm, gated, normv, conv, ring, p) : 0; }
+static inline int cc_kvput(CcBuf *kc, CcBuf *vc, CcBuf *k, CcBuf *v, CcBuf *pos, const CcKvPut *p) { const ColiCudaChainOps *t = cc_ops(); return t ? t->kvput(kc, vc, k, v, pos, p) : 0; }
+static inline int cc_graph_begin(void) { const ColiCudaChainOps *t = cc_ops(); return t ? t->graph_begin() : 0; }
+static inline CcGraph *cc_graph_end(void) { const ColiCudaChainOps *t = cc_ops(); return t ? t->graph_end() : NULL; }
+static inline int cc_graph_launch(CcGraph *g) { const ColiCudaChainOps *t = cc_ops(); return t && g ? t->graph_launch(g) : 0; }
+static inline void cc_graph_free(CcGraph *g) { const ColiCudaChainOps *t = cc_ops(); if (t && g) t->graph_free(g); }
 static inline int cc_experts(ColiCudaTensor *const *g, ColiCudaTensor *const *u, ColiCudaTensor *const *d, const float *vals, int count, CcBuf *x, size_t xo, CcBuf *y, size_t yo) { const ColiCudaChainOps *t = cc_ops(); return t ? t->experts(g, u, d, vals, count, x, xo, y, yo) : 0; }
 #endif
 

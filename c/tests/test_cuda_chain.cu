@@ -307,7 +307,7 @@ int main(void) {
         const int H = 4, KV = 2, hd = 32, qdim = 2 * hd, cap = 300, pos_base = 140, S = 5, k_off = 64;
         std::vector<float> q = rnd((size_t)S * H * qdim, 41), kc = rnd((size_t)k_off + (size_t)KV * cap * hd, 42), vc = rnd((size_t)k_off + (size_t)KV * cap * hd, 43);
         std::vector<float> o((size_t)S * H * hd), ref = o;
-        CcAttn p = {S, H, KV, hd, pos_base, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), k_off, k_off};
+        CcAttn p = {S, H, KV, hd, pos_base, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), k_off, k_off, 0};
         ref_attn(q.data(), kc.data(), vc.data(), ref.data(), q.data(), NULL, &p);
         CcBuf *qb = up(q), *kb = up(kc), *vb = up(vc), *ob = T->buf(o.size() * 4, CC_DEV);
         ck(T->begin() && T->attn(qb, kb, vb, ob, qb, NULL, &p) && T->submit(1) && maxdiff(down(ob, o.size()).data(), ref.data(), o.size()) < 1e-4, "causal GQA with the gate, five rows after 140");
@@ -488,6 +488,50 @@ int main(void) {
         ck(st.experts == 7, "the counter saw seven experts");
         for (int c = 0; c < N; c++) { coli_cuda_tensor_free(tg[c]); coli_cuda_tensor_free(tu[c]); coli_cuda_tensor_free(td[c]); coli_cuda_tensor_free(tg4[c]); coli_cuda_tensor_free(tu4[c]); coli_cuda_tensor_free(td8[c]); }
         T->free(xb); T->free(yb);
+    }
+    printf("kvput and a position buffer\n");
+    {
+        const int H = 4, KV = 2, hd = 32, qdim = 2 * hd, cap = 300, pos_base = 140, S = 5, k_off = 64;
+        std::vector<float> q = rnd((size_t)S * H * qdim, 141), kc = rnd((size_t)k_off + (size_t)KV * cap * hd, 142), vc = rnd((size_t)k_off + (size_t)KV * cap * hd, 143);
+        std::vector<float> k = rnd((size_t)S * KV * hd, 144), v = rnd((size_t)S * KV * hd, 145);
+        std::vector<float> rk = kc, rv = vc;
+        for (int s = 0; s < S; s++) for (int h = 0; h < KV; h++) for (int d = 0; d < hd; d++) {
+            rk[k_off + ((size_t)h * cap + pos_base + s) * hd + d] = k[(size_t)s * KV * hd + h * hd + d];
+            rv[k_off + ((size_t)h * cap + pos_base + s) * hd + d] = v[(size_t)s * KV * hd + h * hd + d]; }
+        CcBuf *kb = up(kc), *vb = up(vc), *nk = up(k), *nv = up(v), *pos = T->buf(16, CC_UP);
+        CcKvPut kp = {S, KV, hd, cap, KV * hd, pos_base, k_off, k_off};
+        ck(T->begin() && T->kvput(kb, vb, nk, nv, NULL, &kp) && T->submit(1) && maxdiff(down(kb, kc.size()).data(), rk.data(), kc.size()) == 0 && maxdiff(down(vb, vc.size()).data(), rv.data(), vc.size()) == 0,
+           "five rows of K and V into the caches at 140");
+        ((int *)T->ptr(pos))[0] = pos_base + 7;
+        for (int s = 0; s < S; s++) for (int h = 0; h < KV; h++) for (int d = 0; d < hd; d++) rk[k_off + ((size_t)h * cap + pos_base + 7 + s) * hd + d] = k[(size_t)s * KV * hd + h * hd + d];
+        kp.pos_base = -1;
+        ck(T->begin() && T->kvput(kb, vb, nk, nv, pos, &kp) && T->submit(1) && maxdiff(down(kb, kc.size()).data(), rk.data(), kc.size()) == 0, "at the position buffer's 147");
+        /* the attention with pos_dyn equals the one with pos_base */
+        std::vector<float> o((size_t)S * H * hd), ref = o;
+        CcAttn p = {S, H, KV, hd, pos_base + 7, cap, 0, H * qdim, qdim, hd, H * qdim, qdim, 1, 0, H * hd, 0, 0, 1.f / sqrtf((float)hd), k_off, k_off, 0};
+        std::vector<float> kd = down(kb, kc.size()), vd = down(vb, vc.size());
+        ref_attn(q.data(), kd.data(), vd.data(), ref.data(), q.data(), NULL, &p);
+        CcBuf *qb = up(q), *ob = T->buf(o.size() * 4, CC_DEV);
+        CcAttn pd = p; pd.pos_base = -1; pd.pos_dyn = 1;
+        ck(T->begin() && T->attn(qb, kb, vb, ob, qb, pos, &pd) && T->submit(1) && maxdiff(down(ob, o.size()).data(), ref.data(), o.size()) < 1e-4, "the attention reads its position from the buffer");
+        printf("graphs\n");
+        /* a frame captured once: norm + add, launched three times at three positions of the buffer */
+        const int D = 96; std::vector<float> xv = rnd(D, 151), wv = rnd(D, 152, 0.3f);
+        CcBuf *xb = up(xv), *wb = up(wv), *yb = T->buf(D * 4, CC_DEV), *acc = T->buf(D * 4, CC_DEV);
+        T->begin(); T->zero(acc, 0, D); T->submit(1);
+        CcNorm np = {1, D, 1, 0, D, D, 0, D, D, 0, 0, CC_NORM_ADD1, 1e-6f, 1.f};
+        CcEw add = {CC_EW_ADD, D, D, 1, 0, 1, 0, 0, 0, 0, 0, 1.f};
+        ck(T->begin() && T->graph_begin() && T->norm(xb, wb, yb, &np) && T->ew(acc, acc, yb, NULL, NULL, &add) && !T->submit(0), "a capture takes the ops; submit is refused meanwhile");
+        CcGraph *g = T->graph_end();
+        ck(g != NULL && !T->lost(), "the graph instantiated");
+        std::vector<float> before = down(acc, D);
+        ck(maxdiff(before.data(), std::vector<float>(D, 0.f).data(), D) == 0, "nothing ran during the capture");
+        for (int r = 0; r < 3; r++) ck(T->graph_launch(g) && T->submit(1), "a launch");
+        std::vector<float> yn(D); { float a = 0; for (int i = 0; i < D; i++) a += xv[i] * xv[i]; float rr = 1.f / sqrtf(a / D + 1e-6f); for (int i = 0; i < D; i++) yn[i] = xv[i] * rr * (1.f + wv[i]) * 3.f; }
+        ck(maxdiff(down(acc, D).data(), yn.data(), D) < 1e-4, "three launches added the norm three times");
+        ck(T->begin() && T->graph_begin() && !T->experts(NULL, NULL, NULL, NULL, 1, xb, 0, yb, 0) && T->graph_end() != NULL, "experts are refused inside a capture without losing it");
+        T->graph_free(g);
+        T->free(kb); T->free(vb); T->free(nk); T->free(nv); T->free(pos); T->free(qb); T->free(ob); T->free(xb); T->free(wb); T->free(yb); T->free(acc);
     }
     printf("lost\n");
     {
