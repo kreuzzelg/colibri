@@ -621,6 +621,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 
+- **qwen36, qwen38: `DUMP` writes every sampled row, `SNAP` falls back to `COLI_MODEL`.** `DUMP=<path>` used
+  to keep the last token's logits only; it now appends every row a token is sampled from, raw f32,
+  vocab floats a row, as colibri.c's `dump_logits` does, so a comparison sees the whole path, not
+  its end (the CI gates that `cmp` two runs' dumps compare the same rows as before, there are
+  just more of them). Both engines take the model directory from `COLI_MODEL` when `SNAP` is
+  unset, as colibri.c does.
+
 - **Inkling's expert cache from the RAM plan in `coli serve`**: without `--cap` the engine got
   the legacy eight slots a layer, and on Inkling-2 (eight routed experts a token) nearly every
   expert of a step came again from the page cache. Inkling-2-Mini UD-Q4_K_XL on the CPU: 4.3 ->

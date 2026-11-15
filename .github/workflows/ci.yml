@@ -942,6 +942,8 @@ jobs:
           done
       - name: Qwen3.6 checkpoint MTP (reference logits, exact verifies, multi-turn serve)
         run: make -C c qwen36-tiny-mtp-check
+      - name: Qwen3.6 DUMP writes every sampled row (one row a token, argmax = the token, requests append)
+        run: make -C c qwen36-dump-check
       - name: Qwen3.8-2.4T geometry, fused experts + mtp head (converter contract + token-exact)
         run: |
           cd c
